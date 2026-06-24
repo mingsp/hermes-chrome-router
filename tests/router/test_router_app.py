@@ -1,13 +1,9 @@
 import asyncio
-from collections import deque
-
-from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from router.app import create_router_app, dispatch_command
 from router.config import RouterConfig
 from router.registry import TransitCommand
-from router.route_table import ProfileRoute
 from shared.protocol import CloudCommand
 
 
@@ -47,43 +43,6 @@ class FakeDeviceTokenVerifier:
         return self.verified_device_id
 
 
-class FakeRouteTable:
-    def __init__(self):
-        self.registered = []
-        self.unregistered = []
-        self.routes = {}
-
-    async def register_profiles(self, *, server_id, device_id, profile_ids, ttl_seconds):
-        self.registered.append(
-            {
-                "server_id": server_id,
-                "device_id": device_id,
-                "profile_ids": tuple(profile_ids),
-                "ttl_seconds": ttl_seconds,
-            }
-        )
-
-    async def unregister_profiles(self, *, server_id, device_id, profile_ids):
-        self.unregistered.append(
-            {
-                "server_id": server_id,
-                "device_id": device_id,
-                "profile_ids": tuple(profile_ids),
-            }
-        )
-
-    async def get_profile_route(self, profile_id):
-        return self.routes.get(profile_id)
-
-
-class FakeInternalForwarder:
-    def __init__(self):
-        self.forwarded = []
-
-    async def forward_command(self, server_id, command):
-        self.forwarded.append({"server_id": server_id, "command": command})
-
-
 async def test_health_and_status(tmp_path):
     cloud = FakeCloudBridge()
     config = RouterConfig(
@@ -102,7 +61,6 @@ async def test_health_and_status(tmp_path):
         assert await health.json() == {"ok": True}
         status = await client.get("/status", headers={"authorization": "Bearer dev-token"})
         payload = await status.json()
-        assert payload["serverId"] == "local"
         assert payload["bindings"] == {"xuxiaofeng_profile": "span-macbook"}
     finally:
         await client.close()
@@ -280,6 +238,140 @@ async def test_audit_summary_reports_cross_profile_operational_counts(tmp_path):
         ]
         assert payload["byStatus"] == [{"status": "failed", "total": 2}]
         assert payload["byAction"] == [{"action": "page.click", "total": 2, "failed": 2}]
+    finally:
+        await client.close()
+
+
+async def test_management_overview_requires_router_token(tmp_path):
+    cloud = FakeCloudBridge()
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={"xuxiaofeng_profile": "span-macbook"},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get("/management/overview")
+
+        assert response.status == 401
+        assert await response.json() == {"error": "unauthorized"}
+    finally:
+        await client.close()
+
+
+async def test_management_overview_reports_router_connections_and_bindings(tmp_path):
+    cloud = FakeCloudBridge()
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={"xuxiaofeng_profile": "span-macbook"},
+        binding_policies={"xuxiaofeng_profile": {"local_action_mode": "confirm"}},
+        min_client_version="0.2.0",
+        rate_limit_per_profile=7,
+        rate_limit_burst=11,
+        audit_db_path=tmp_path / "router-audit.sqlite3",
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/bridge")
+        await ws.send_json(
+            {
+                "type": "hello",
+                "deviceId": "span-macbook",
+                "token": "dev-token",
+                "profileIds": ["xuxiaofeng_profile"],
+                "clientVersion": "0.2.0",
+            }
+        )
+        await ws.receive_json()
+
+        response = await client.get(
+            "/management/overview",
+            headers={"authorization": "Bearer dev-token"},
+        )
+
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["router"]["status"] == "healthy"
+        assert isinstance(payload["router"]["now"], int)
+        assert payload["router"]["minClientVersion"] == "0.2.0"
+        assert payload["router"]["rateLimitPerProfile"] == 7
+        assert payload["router"]["rateLimitBurst"] == 11
+        assert payload["router"]["auditEnabled"] is True
+        assert payload["cloudBridge"] == {
+            "url": "http://cloud",
+            "healthy": True,
+            "lastError": None,
+        }
+        assert payload["connections"]["total"] == 1
+        assert payload["connections"]["devices"][0]["deviceId"] == "span-macbook"
+        assert payload["bindings"][0]["profileId"] == "xuxiaofeng_profile"
+        assert payload["bindings"][0]["deviceId"] == "span-macbook"
+        assert payload["bindings"][0]["online"] is True
+        assert payload["bindings"][0]["actionPolicy"] == {"local_action_mode": "confirm"}
+        assert payload["bindings"][0]["toolGate"]["enabled"] is True
+        assert payload["commands"]["inFlight"] == []
+        assert payload["commands"]["auditSummary"]["total"] == 0
+    finally:
+        await client.close()
+
+
+async def test_management_overview_reports_degraded_cloud_result_channel(tmp_path):
+    cloud = FakeCloudBridge()
+    cloud.fail_results = True
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+
+    await dispatch_command(
+        app,
+        CloudCommand(
+            id="cmd_missing",
+            profile_id="missing_profile",
+            action="page.click",
+            params={},
+        ),
+    )
+
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        response = await client.get(
+            "/management/overview",
+            headers={"authorization": "Bearer dev-token"},
+        )
+
+        assert response.status == 200
+        payload = await response.json()
+        assert payload["router"]["status"] == "degraded"
+        assert payload["cloudBridge"]["healthy"] is False
+        assert payload["cloudBridge"]["lastError"] == "cloud result unavailable"
+        assert payload["router"]["auditEnabled"] is False
+        assert payload["commands"]["auditSummary"] == {
+            "total": 0,
+            "failed": 0,
+            "profiles": 0,
+            "devices": 0,
+            "byProfile": [],
+            "byStatus": [],
+            "byAction": [],
+        }
     finally:
         await client.close()
 
@@ -503,7 +595,6 @@ async def test_websocket_hello_and_result_relay(tmp_path):
             "type": "hello_ack",
             "deviceId": "span-macbook",
             "minClientVersion": "0.1.0",
-            "serverId": "local",
         }
 
         registry = app["registry"]
@@ -604,135 +695,6 @@ async def test_audit_commands_records_completed_websocket_results(tmp_path):
         await client.close()
 
 
-async def test_websocket_registers_and_unregisters_redis_route_table(tmp_path):
-    cloud = FakeCloudBridge()
-    route_table = FakeRouteTable()
-    config = RouterConfig(
-        host="127.0.0.1",
-        port=0,
-        cloud_bridge_url="http://cloud",
-        router_token="dev-token",
-        bindings_path=tmp_path / "bindings.json",
-        bindings={"xuxiaofeng_profile": "span-macbook"},
-        server_id="router-a",
-        route_ttl_seconds=30,
-    )
-    app = create_router_app(config, cloud_bridge=cloud, route_table=route_table, start_poller=False)
-    client = TestClient(TestServer(app))
-    await client.start_server()
-    try:
-        ws = await client.ws_connect("/bridge")
-        await ws.send_json(
-            {
-                "type": "hello",
-                "deviceId": "span-macbook",
-                "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
-                "clientVersion": "0.1.0",
-            }
-        )
-
-        assert await ws.receive_json() == {
-            "type": "hello_ack",
-            "deviceId": "span-macbook",
-            "minClientVersion": "0.1.0",
-            "serverId": "router-a",
-        }
-        assert route_table.registered == [
-            {
-                "server_id": "router-a",
-                "device_id": "span-macbook",
-                "profile_ids": ("xuxiaofeng_profile",),
-                "ttl_seconds": 30,
-            }
-        ]
-
-        await ws.send_json(
-            {
-                "type": "heartbeat",
-                "timestamp": 1718500000000,
-                "extensionConnected": True,
-                "extensionVersion": "0.15.38",
-            }
-        )
-        await ws.receive_json()
-
-        assert route_table.registered == [
-            {
-                "server_id": "router-a",
-                "device_id": "span-macbook",
-                "profile_ids": ("xuxiaofeng_profile",),
-                "ttl_seconds": 30,
-            },
-            {
-                "server_id": "router-a",
-                "device_id": "span-macbook",
-                "profile_ids": ("xuxiaofeng_profile",),
-                "ttl_seconds": 30,
-            },
-        ]
-
-        await ws.close()
-        for _ in range(50):
-            if route_table.unregistered:
-                break
-            await asyncio.sleep(0.01)
-
-        assert route_table.unregistered == [
-            {
-                "server_id": "router-a",
-                "device_id": "span-macbook",
-                "profile_ids": ("xuxiaofeng_profile",),
-            }
-        ]
-    finally:
-        await client.close()
-
-
-async def test_websocket_registers_only_profiles_bound_to_device_in_route_table(tmp_path):
-    cloud = FakeCloudBridge()
-    route_table = FakeRouteTable()
-    config = RouterConfig(
-        host="127.0.0.1",
-        port=0,
-        cloud_bridge_url="http://cloud",
-        router_token="dev-token",
-        bindings_path=tmp_path / "bindings.json",
-        bindings={
-            "xuxiaofeng_profile": "span-macbook",
-            "default": "other-mac",
-        },
-        server_id="router-a",
-        route_ttl_seconds=30,
-    )
-    app = create_router_app(config, cloud_bridge=cloud, route_table=route_table, start_poller=False)
-    client = TestClient(TestServer(app))
-    await client.start_server()
-    try:
-        ws = await client.ws_connect("/bridge")
-        await ws.send_json(
-            {
-                "type": "hello",
-                "deviceId": "span-macbook",
-                "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile", "default"],
-                "clientVersion": "0.1.0",
-            }
-        )
-        await ws.receive_json()
-
-        assert route_table.registered == [
-            {
-                "server_id": "router-a",
-                "device_id": "span-macbook",
-                "profile_ids": ("xuxiaofeng_profile",),
-                "ttl_seconds": 30,
-            }
-        ]
-    finally:
-        await client.close()
-
-
 async def test_websocket_heartbeat_updates_connection_status(tmp_path):
     cloud = FakeCloudBridge()
     config = RouterConfig(
@@ -761,7 +723,6 @@ async def test_websocket_heartbeat_updates_connection_status(tmp_path):
             "type": "hello_ack",
             "deviceId": "span-macbook",
             "minClientVersion": "0.1.0",
-            "serverId": "local",
         }
 
         await ws.send_json(
@@ -1041,7 +1002,6 @@ async def test_websocket_accepts_verified_device_token(tmp_path):
             "type": "hello_ack",
             "deviceId": "span-macbook",
             "minClientVersion": "0.1.0",
-            "serverId": "local",
         }
         assert verifier.tokens == ["hclc_device_token"]
     finally:
@@ -1115,258 +1075,6 @@ async def test_dispatch_no_binding_posts_cloud_error(tmp_path):
             "error": "browser binding not found for profile missing_profile",
         }
     ]
-
-
-async def test_dispatch_forwards_to_remote_router_when_profile_route_is_remote(tmp_path):
-    cloud = FakeCloudBridge()
-    route_table = FakeRouteTable()
-    route_table.routes["xuxiaofeng_profile"] = ProfileRoute(
-        profile_id="xuxiaofeng_profile",
-        server_id="router-b",
-        device_id="span-macbook",
-    )
-    forwarder = FakeInternalForwarder()
-    config = RouterConfig(
-        host="127.0.0.1",
-        port=0,
-        cloud_bridge_url="http://cloud",
-        router_token="dev-token",
-        bindings_path=tmp_path / "bindings.json",
-        bindings={"xuxiaofeng_profile": "span-macbook"},
-        server_id="router-a",
-    )
-    app = create_router_app(
-        config,
-        cloud_bridge=cloud,
-        route_table=route_table,
-        internal_forwarder=forwarder,
-        start_poller=False,
-    )
-
-    await dispatch_command(
-        app,
-        CloudCommand(
-            id="cmd_remote",
-            profile_id="xuxiaofeng_profile",
-            action="page.click",
-            params={"uid": "el-1"},
-        ),
-    )
-
-    assert len(forwarder.forwarded) == 1
-    forwarded = forwarder.forwarded[0]
-    assert forwarded["server_id"] == "router-b"
-    assert forwarded["command"] == TransitCommand(
-        id="cmd_remote",
-        profile_id="xuxiaofeng_profile",
-        cloud_bridge_url="http://cloud",
-        action="page.click",
-        params={"uid": "el-1"},
-        timeout_ms=28000,
-    )
-    assert cloud.results == []
-    assert app["queues"]["xuxiaofeng_profile"] == deque()
-
-
-async def test_dispatch_remote_route_without_peer_posts_cloud_error(tmp_path):
-    cloud = FakeCloudBridge()
-    route_table = FakeRouteTable()
-    route_table.routes["xuxiaofeng_profile"] = ProfileRoute(
-        profile_id="xuxiaofeng_profile",
-        server_id="router-b",
-        device_id="span-macbook",
-    )
-    config = RouterConfig(
-        host="127.0.0.1",
-        port=0,
-        cloud_bridge_url="http://cloud",
-        router_token="dev-token",
-        bindings_path=tmp_path / "bindings.json",
-        bindings={"xuxiaofeng_profile": "span-macbook"},
-        server_id="router-a",
-    )
-    app = create_router_app(
-        config,
-        cloud_bridge=cloud,
-        route_table=route_table,
-        start_poller=False,
-    )
-
-    await dispatch_command(
-        app,
-        CloudCommand(
-            id="cmd_remote",
-            profile_id="xuxiaofeng_profile",
-            action="page.click",
-            params={},
-        ),
-    )
-
-    assert cloud.results == [
-        {
-            "id": "cmd_remote",
-            "ok": False,
-            "result": None,
-            "error": "no peer Router configured for server router-b",
-        }
-    ]
-
-
-async def test_internal_command_endpoint_enqueues_for_local_delivery(tmp_path):
-    cloud = FakeCloudBridge()
-    config = RouterConfig(
-        host="127.0.0.1",
-        port=0,
-        cloud_bridge_url="http://cloud",
-        router_token="dev-token",
-        bindings_path=tmp_path / "bindings.json",
-        bindings={"xuxiaofeng_profile": "span-macbook"},
-        server_id="router-b",
-    )
-    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
-    client = TestClient(TestServer(app))
-    await client.start_server()
-    try:
-        ws = await client.ws_connect("/bridge")
-        await ws.send_json(
-            {
-                "type": "hello",
-                "deviceId": "span-macbook",
-                "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
-                "clientVersion": "0.1.0",
-            }
-        )
-        await ws.receive_json()
-
-        response = await client.post(
-            "/internal/commands",
-            headers={"authorization": "Bearer dev-token"},
-            json={
-                "id": "cmd_remote",
-                "profileId": "xuxiaofeng_profile",
-                "cloudBridgeUrl": "http://cloud",
-                "action": "page.click",
-                "params": {"uid": "el-1"},
-                "timeoutMs": 28000,
-            },
-        )
-
-        assert response.status == 202
-        assert await response.json() == {"ok": True}
-        frame = await ws.receive_json()
-        assert frame == {
-            "type": "command",
-            "id": "cmd_remote",
-            "profileId": "xuxiaofeng_profile",
-            "action": "page.click",
-            "params": {"uid": "el-1"},
-            "timeoutMs": 28000,
-        }
-    finally:
-        await client.close()
-
-
-async def test_internal_command_result_posts_to_transit_cloud_bridge_url(aiohttp_server, tmp_path):
-    source_results = []
-    target_results = []
-
-    async def source_result(request):
-        source_results.append(await request.json())
-        return web.json_response({"ok": True})
-
-    async def target_result(request):
-        target_results.append(await request.json())
-        return web.json_response({"ok": True})
-
-    source_cloud = web.Application()
-    source_cloud.router.add_post("/result", source_result)
-    source_server = await aiohttp_server(source_cloud)
-    target_cloud = web.Application()
-    target_cloud.router.add_post("/result", target_result)
-    target_server = await aiohttp_server(target_cloud)
-
-    config = RouterConfig(
-        host="127.0.0.1",
-        port=0,
-        cloud_bridge_url=f"http://{target_server.host}:{target_server.port}",
-        router_token="dev-token",
-        bindings_path=tmp_path / "bindings.json",
-        bindings={"xuxiaofeng_profile": "span-macbook"},
-        server_id="router-b",
-    )
-    app = create_router_app(config, start_poller=False)
-    client = TestClient(TestServer(app))
-    await client.start_server()
-    try:
-        ws = await client.ws_connect("/bridge")
-        await ws.send_json(
-            {
-                "type": "hello",
-                "deviceId": "span-macbook",
-                "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
-                "clientVersion": "0.1.0",
-            }
-        )
-        await ws.receive_json()
-
-        response = await client.post(
-            "/internal/commands",
-            headers={"authorization": "Bearer dev-token"},
-            json={
-                "id": "cmd_remote",
-                "profileId": "xuxiaofeng_profile",
-                "cloudBridgeUrl": f"http://{source_server.host}:{source_server.port}",
-                "action": "tab.list",
-                "params": {},
-                "timeoutMs": 28000,
-            },
-        )
-        assert response.status == 202
-        await ws.receive_json()
-
-        await ws.send_json(
-            {
-                "type": "result",
-                "id": "cmd_remote",
-                "profileId": "xuxiaofeng_profile",
-                "ok": True,
-                "result": {"tabs": []},
-            }
-        )
-
-        for _ in range(50):
-            if source_results:
-                break
-            await asyncio.sleep(0.01)
-
-        assert source_results == [{"id": "cmd_remote", "ok": True, "result": {"tabs": []}}]
-        assert target_results == []
-    finally:
-        await client.close()
-
-
-async def test_internal_command_endpoint_requires_router_token(tmp_path):
-    cloud = FakeCloudBridge()
-    config = RouterConfig(
-        host="127.0.0.1",
-        port=0,
-        cloud_bridge_url="http://cloud",
-        router_token="dev-token",
-        bindings_path=tmp_path / "bindings.json",
-        bindings={"xuxiaofeng_profile": "span-macbook"},
-    )
-    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
-    client = TestClient(TestServer(app))
-    await client.start_server()
-    try:
-        response = await client.post("/internal/commands", json={})
-
-        assert response.status == 401
-        assert await response.json() == {"error": "unauthorized"}
-    finally:
-        await client.close()
 
 
 async def test_dispatch_rate_limit_posts_cloud_error(tmp_path):
