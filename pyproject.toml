@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-chrome-router"
+version = "0.1.0"
+description = "Hermes Chrome Command Router and protocol harness"
+requires-python = ">=3.11"
+dependencies = [
+  "aiohttp>=3.9,<4",
+  "redis>=5,<6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.23,<1",
+  "pytest-aiohttp>=1.0,<2",
+]
+
+[project.scripts]
+hermes-chrome-router = "router.__main__:main"
+hermes-chrome-router-acceptance-archive = "router.acceptance_archive:main"
+hermes-chrome-router-acceptance-bundle = "router.acceptance_bundle:main"
+hermes-chrome-router-gateway-doctor = "router.gateway_readiness:main"
+hermes-chrome-router-gateway-acceptance = "router.gateway_acceptance:main"
+hermes-chrome-router-e2e-doctor = "router.e2e_readiness:main"
+hermes-chrome-router-e2e-acceptance = "router.e2e_acceptance:main"
+hermes-chrome-router-remote-acceptance = "router.remote_acceptance_run:main"
+hermes-chrome-router-harness = "harness.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["router*", "shared*", "harness*"]

@@ -1,0 +1,872 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import time
+import uuid
+from collections import defaultdict, deque
+from typing import Any
+
+from aiohttp import WSMsgType, web
+
+from router.audit import CommandAuditStore
+from router.bindings import WebUIBindingProvider
+from router.cloud_bridge import CloudBridgeClient, MalformedCloudCommand
+from router.config import RouterConfig
+from router.device_tokens import WebUIDeviceTokenVerifier
+from router.internal_forwarder import InternalCommandForwarder
+from router.registry import RouterRegistry, TransitCommand
+from router.route_table import create_redis_profile_route_table
+from shared.errors import DeliveryError, ProtocolError
+from shared.errors import profile_mismatch as profile_mismatch_message
+from shared.protocol import (
+    CommandFrame,
+    command_frame_to_json,
+    parse_hello_frame,
+    parse_result_frame,
+)
+from shared.timing import ROUTER_DELIVERY_TIMEOUT_MS
+
+
+def _make_transit_factory(config: RouterConfig):
+    def factory(
+        command_id: str,
+        profile_id: str,
+        action: str,
+        params: dict[str, Any],
+        timeout_ms: int,
+    ) -> TransitCommand:
+        return TransitCommand(
+            id=command_id,
+            profile_id=profile_id,
+            cloud_bridge_url=config.cloud_bridge_url,
+            action=action,
+            params=params,
+            timeout_ms=timeout_ms,
+        )
+
+    return factory
+
+
+async def _health(_request: web.Request) -> web.Response:
+    return web.json_response({"ok": True})
+
+
+async def _status(request: web.Request) -> web.Response:
+    config: RouterConfig = request.app["config"]
+    if not _is_authorized_router_request(request, config):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    registry: RouterRegistry = request.app["registry"]
+    payload = registry.status()
+    payload["serverId"] = config.server_id
+    return web.json_response(payload)
+
+
+async def _metrics(request: web.Request) -> web.Response:
+    config: RouterConfig = request.app["config"]
+    if not _is_authorized_router_request(request, config):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    registry: RouterRegistry = request.app["registry"]
+    status = registry.status()
+    queued_commands = sum(len(queue) for queue in request.app["queues"].values())
+    lines = [
+        "# HELP hermes_chrome_router_connected_clients Number of connected Hermes Local Client websocket sessions.",
+        "# TYPE hermes_chrome_router_connected_clients gauge",
+        f"hermes_chrome_router_connected_clients {len(status['connections'])}",
+        "# HELP hermes_chrome_router_bound_profiles Number of profile browser bindings known by the router.",
+        "# TYPE hermes_chrome_router_bound_profiles gauge",
+        f"hermes_chrome_router_bound_profiles {len(status['bindings'])}",
+        "# HELP hermes_chrome_router_inflight_commands Number of commands delivered to Local Clients and waiting for results.",
+        "# TYPE hermes_chrome_router_inflight_commands gauge",
+        f"hermes_chrome_router_inflight_commands {len(status['inFlight'])}",
+        "# HELP hermes_chrome_router_queued_commands Number of commands queued before Local Client delivery.",
+        "# TYPE hermes_chrome_router_queued_commands gauge",
+        f"hermes_chrome_router_queued_commands {queued_commands}",
+        "# HELP hermes_chrome_router_cloud_result_error Whether the cloud bridge result channel currently has an error.",
+        "# TYPE hermes_chrome_router_cloud_result_error gauge",
+        f"hermes_chrome_router_cloud_result_error {1 if status['lastCloudResultError'] else 0}",
+        "# HELP hermes_chrome_router_profile_online Whether each bound profile has an online Local Client connection.",
+        "# TYPE hermes_chrome_router_profile_online gauge",
+    ]
+    connection_details = status["connectionDetails"]
+    for profile_id, device_id in sorted(status["bindings"].items()):
+        connection = connection_details.get(device_id) or {}
+        online = profile_id in (connection.get("profileIds") or [])
+        labels = _prometheus_labels(profile_id=profile_id, device_id=device_id)
+        lines.append(f"hermes_chrome_router_profile_online{{{labels}}} {1 if online else 0}")
+    lines.extend(
+        [
+            "# HELP hermes_chrome_router_profile_commands_total Total Chrome commands completed by profile.",
+            "# TYPE hermes_chrome_router_profile_commands_total counter",
+            "# HELP hermes_chrome_router_profile_command_errors_total Total failed Chrome commands by profile.",
+            "# TYPE hermes_chrome_router_profile_command_errors_total counter",
+            "# HELP hermes_chrome_router_profile_command_error_rate Failed Chrome commands divided by completed commands by profile.",
+            "# TYPE hermes_chrome_router_profile_command_error_rate gauge",
+        ]
+    )
+    for profile_id, stats in sorted(status["commandStats"].items()):
+        labels = _prometheus_labels(profile_id=profile_id)
+        lines.append(f"hermes_chrome_router_profile_commands_total{{{labels}}} {stats['total']}")
+        lines.append(f"hermes_chrome_router_profile_command_errors_total{{{labels}}} {stats['failure']}")
+        lines.append(f"hermes_chrome_router_profile_command_error_rate{{{labels}}} {stats['errorRate']}")
+    body = "\n".join(lines) + "\n"
+    return web.Response(
+        body=body.encode("utf-8"),
+        headers={"Content-Type": "text/plain; version=0.0.4; charset=utf-8"},
+    )
+
+
+def _prometheus_labels(**labels: str) -> str:
+    return ",".join(
+        f'{key}="{_prometheus_escape(str(value))}"'
+        for key, value in labels.items()
+    )
+
+
+def _prometheus_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+async def _profile_status(request: web.Request) -> web.Response:
+    config: RouterConfig = request.app["config"]
+    if not _is_authorized_router_request(request, config):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    registry: RouterRegistry = request.app["registry"]
+    profile_id = str(request.match_info.get("profile_id") or "").strip()
+    if not profile_id:
+        raise web.HTTPBadRequest(text="profile_id is required")
+    return web.json_response(registry.profile_status(profile_id))
+
+
+async def _audit_commands(request: web.Request) -> web.Response:
+    config: RouterConfig = request.app["config"]
+    if not _is_authorized_router_request(request, config):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    audit_store: CommandAuditStore | None = request.app.get("audit_store")
+    if audit_store is None:
+        return web.json_response(
+            {
+                "count": 0,
+                "total": 0,
+                "limit": _query_int(request, "limit", 100),
+                "offset": _query_int(request, "offset", 0),
+                "items": [],
+            }
+        )
+    limit = _query_int(request, "limit", 100)
+    offset = _query_int(request, "offset", 0)
+    return web.json_response(
+        audit_store.search(
+            profile_id=str(request.query.get("profileId") or request.query.get("profile_id") or "").strip(),
+            command_id=str(request.query.get("commandId") or request.query.get("command_id") or "").strip(),
+            device_id=str(request.query.get("deviceId") or request.query.get("device_id") or "").strip(),
+            action=str(request.query.get("action") or "").strip(),
+            status=str(request.query.get("status") or "").strip(),
+            q=str(request.query.get("q") or "").strip(),
+            from_ms=_query_optional_int(request, "fromMs", "from_ms"),
+            to_ms=_query_optional_int(request, "toMs", "to_ms"),
+            limit=limit,
+            offset=offset,
+        )
+    )
+
+
+async def _audit_summary(request: web.Request) -> web.Response:
+    config: RouterConfig = request.app["config"]
+    if not _is_authorized_router_request(request, config):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    audit_store: CommandAuditStore | None = request.app.get("audit_store")
+    if audit_store is None:
+        return web.json_response(
+            {
+                "total": 0,
+                "failed": 0,
+                "profiles": 0,
+                "devices": 0,
+                "byProfile": [],
+                "byStatus": [],
+                "byAction": [],
+            }
+        )
+    return web.json_response(
+        audit_store.summary(
+            profile_id=str(request.query.get("profileId") or request.query.get("profile_id") or "").strip(),
+            command_id=str(request.query.get("commandId") or request.query.get("command_id") or "").strip(),
+            device_id=str(request.query.get("deviceId") or request.query.get("device_id") or "").strip(),
+            action=str(request.query.get("action") or "").strip(),
+            status=str(request.query.get("status") or "").strip(),
+            q=str(request.query.get("q") or "").strip(),
+            from_ms=_query_optional_int(request, "fromMs", "from_ms"),
+            to_ms=_query_optional_int(request, "toMs", "to_ms"),
+        )
+    )
+
+
+def _query_optional_int(request: web.Request, *keys: str) -> int | None:
+    for key in keys:
+        raw = request.query.get(key)
+        if raw is None or str(raw).strip() == "":
+            continue
+        try:
+            return int(str(raw))
+        except ValueError:
+            return None
+    return None
+
+
+def _query_int(request: web.Request, key: str, default: int) -> int:
+    try:
+        return int(str(request.query.get(key) or default))
+    except ValueError:
+        return default
+
+
+async def _refresh_bindings(request: web.Request) -> web.Response:
+    config: RouterConfig = request.app["config"]
+    if not _is_authorized_router_request(request, config):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        bindings, policies = await _load_binding_snapshot(request.app)
+    except Exception as exc:
+        request.app["registry"].record_cloud_result_error(str(exc))
+        return web.json_response({"error": str(exc)}, status=502)
+    request.app["registry"].update_bindings(bindings, policies)
+    request.app["registry"].clear_cloud_result_error()
+    return web.json_response({"ok": True, "bindings": bindings, "actionPolicies": policies})
+
+
+async def _internal_command(request: web.Request) -> web.Response:
+    config: RouterConfig = request.app["config"]
+    if not _is_authorized_router_request(request, config):
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        payload = await request.json()
+        command = _parse_internal_command(payload, config)
+    except (ProtocolError, ValueError, TypeError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    await _enqueue_local_command(request.app, command)
+    return web.json_response({"ok": True}, status=202)
+
+
+def _parse_internal_command(payload: Any, config: RouterConfig) -> TransitCommand:
+    if not isinstance(payload, dict):
+        raise ProtocolError("internal command payload must be an object")
+    params = payload.get("params") or {}
+    if not isinstance(params, dict):
+        raise ProtocolError("command params must be an object")
+    timeout_ms = payload.get("timeoutMs", ROUTER_DELIVERY_TIMEOUT_MS)
+    if not isinstance(timeout_ms, int) or timeout_ms <= 0:
+        raise ProtocolError("timeoutMs must be a positive integer")
+    command_id = _required_payload_str(payload, "id")
+    profile_id = _required_payload_str(payload, "profileId")
+    action = _required_payload_str(payload, "action")
+    cloud_bridge_url = (
+        str(payload.get("cloudBridgeUrl") or "").strip().rstrip("/")
+        or config.cloud_bridge_url
+    )
+    return TransitCommand(
+        id=command_id,
+        profile_id=profile_id,
+        cloud_bridge_url=cloud_bridge_url,
+        action=action,
+        params=params,
+        timeout_ms=timeout_ms,
+    )
+
+
+def _required_payload_str(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ProtocolError(f"missing or invalid {key}")
+    return value.strip()
+
+
+def _is_authorized_router_request(request: web.Request, config: RouterConfig) -> bool:
+    if not config.router_token:
+        return True
+    header = request.headers.get("authorization", "")
+    token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
+    return token == config.router_token
+
+
+async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    config: RouterConfig = request.app["config"]
+    registry: RouterRegistry = request.app["registry"]
+    cloud_bridge = request.app["cloud_bridge"]
+    device_id: str | None = None
+    announced_profile_ids: tuple[str, ...] = ()
+
+    try:
+        first = await ws.receive_json(timeout=5)
+        hello = parse_hello_frame(first)
+        if not await _authorize_hello(request.app, hello):
+            await ws.send_json({"type": "error", "error": "unauthorized"})
+            await ws.close(code=4001, message=b"unauthorized")
+            return ws
+        if _is_client_version_too_old(hello.client_version, config.min_client_version):
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "error": "version_too_old",
+                    "minClientVersion": config.min_client_version,
+                }
+            )
+            await ws.close(code=4003, message=b"version_too_old")
+            return ws
+        device_id = hello.device_id
+        announced_profile_ids = hello.profile_ids
+        registry.register(hello.device_id, hello.profile_ids, ws)
+        await _register_profile_routes(request.app, hello.device_id, hello.profile_ids)
+        await ws.send_json(
+            {
+                "type": "hello_ack",
+                "deviceId": hello.device_id,
+                "minClientVersion": config.min_client_version,
+                "serverId": config.server_id,
+            }
+        )
+
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                continue
+            payload = msg.json()
+            if payload.get("type") == "heartbeat":
+                if device_id:
+                    registry.record_heartbeat(
+                        device_id,
+                        extension_connected=bool(payload.get("extensionConnected")),
+                        extension_version=(
+                            payload.get("extensionVersion")
+                            if isinstance(payload.get("extensionVersion"), str)
+                            else None
+                        ),
+                    )
+                    await _register_profile_routes(request.app, device_id, announced_profile_ids)
+                await ws.send_json({"type": "heartbeat_ack", "timestamp": payload.get("timestamp")})
+                continue
+            if payload.get("type") == "result":
+                result = parse_result_frame(payload)
+                command = registry.get_inflight(result.id)
+                if command is None:
+                    await ws.send_json({"type": "error", "error": f"unknown command id {result.id}"})
+                    continue
+                if command.profile_id != result.profile_id:
+                    await _fail_command(
+                        request.app,
+                        command,
+                        profile_mismatch_message(result.id, command.profile_id, result.profile_id),
+                    )
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "error": profile_mismatch_message(result.id, command.profile_id, result.profile_id),
+                        }
+                    )
+                    continue
+                registry.pop_inflight(result.id, result.profile_id)
+                _cancel_timeout(request.app, result.id)
+                _clear_current(request.app, command)
+                _record_audit(
+                    request.app,
+                    command,
+                    "completed" if result.ok else "failed",
+                    detail=result.error or "",
+                )
+                await _post_cloud_result(
+                    request.app,
+                    result.id,
+                    result.ok,
+                    profile_id=result.profile_id,
+                    result=result.result,
+                    error=result.error,
+                    cloud_bridge_url=command.cloud_bridge_url,
+                )
+                await _dispatch_next_for_profile(request.app, result.profile_id)
+                continue
+            await ws.send_json({"type": "error", "error": f"unsupported frame type {payload.get('type')}"})
+    except (ProtocolError, DeliveryError, TimeoutError) as exc:
+        await ws.send_json({"type": "error", "error": str(exc)})
+    finally:
+        if device_id:
+            await _unregister_profile_routes(request.app, device_id, announced_profile_ids)
+            for command in registry.unregister(device_id):
+                await _fail_command(
+                    request.app,
+                    command,
+                    f"browser bridge disconnected for profile {command.profile_id}",
+                )
+    return ws
+
+
+async def _register_profile_routes(app: web.Application, device_id: str, profile_ids: tuple[str, ...]) -> None:
+    route_table = app.get("route_table")
+    if route_table is None or not profile_ids:
+        return
+    bound_profile_ids = _bound_profile_ids_for_device(app, device_id, profile_ids)
+    if not bound_profile_ids:
+        return
+    config: RouterConfig = app["config"]
+    try:
+        await route_table.register_profiles(
+            server_id=config.server_id,
+            device_id=device_id,
+            profile_ids=bound_profile_ids,
+            ttl_seconds=config.route_ttl_seconds,
+        )
+    except Exception as exc:
+        app["registry"].record_cloud_result_error(f"route table register failed: {exc}")
+
+
+async def _unregister_profile_routes(app: web.Application, device_id: str, profile_ids: tuple[str, ...]) -> None:
+    route_table = app.get("route_table")
+    if route_table is None or not profile_ids:
+        return
+    config: RouterConfig = app["config"]
+    try:
+        await route_table.unregister_profiles(
+            server_id=config.server_id,
+            device_id=device_id,
+            profile_ids=profile_ids,
+        )
+    except Exception as exc:
+        app["registry"].record_cloud_result_error(f"route table unregister failed: {exc}")
+
+
+def _bound_profile_ids_for_device(
+    app: web.Application,
+    device_id: str,
+    profile_ids: tuple[str, ...],
+) -> tuple[str, ...]:
+    bindings = app["registry"].status()["bindings"]
+    return tuple(
+        profile_id
+        for profile_id in profile_ids
+        if bindings.get(profile_id) == device_id
+    )
+
+
+async def _authorize_hello(app: web.Application, hello) -> bool:
+    config: RouterConfig = app["config"]
+    if config.router_token and hello.token == config.router_token:
+        return True
+
+    verifier = app.get("device_token_verifier")
+    if verifier is None:
+        return False
+    try:
+        verified_device_id = await verifier.verify_device_token(hello.token)
+    except Exception as exc:
+        app["registry"].record_cloud_result_error(f"device token verification failed: {exc}")
+        return False
+    return verified_device_id == hello.device_id
+
+
+def _is_client_version_too_old(client_version: str, min_client_version: str) -> bool:
+    return _version_tuple(client_version) < _version_tuple(min_client_version)
+
+
+def _version_tuple(version: str) -> tuple[int, int, int]:
+    parts = []
+    for raw_part in version.split(".")[:3]:
+        digits = ""
+        for char in raw_part:
+            if not char.isdigit():
+                break
+            digits += char
+        parts.append(int(digits or "0"))
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+
+async def dispatch_command(app: web.Application, command) -> None:
+    if _is_rate_limited(app, command.profile_id):
+        await _post_cloud_result(
+            app,
+            command.id,
+            False,
+            profile_id=command.profile_id,
+            error=f"rate limit exceeded for profile {command.profile_id}",
+        )
+        return
+    transit = TransitCommand(
+        id=command.id,
+        profile_id=command.profile_id,
+        cloud_bridge_url=app["config"].cloud_bridge_url,
+        action=command.action,
+        params=command.params,
+        timeout_ms=ROUTER_DELIVERY_TIMEOUT_MS,
+    )
+    if await _forward_remote_command_if_needed(app, transit):
+        return
+    await _enqueue_local_command(app, transit)
+
+
+async def _forward_remote_command_if_needed(app: web.Application, command: TransitCommand) -> bool:
+    route_table = app.get("route_table")
+    if route_table is None:
+        return False
+    try:
+        route = await route_table.get_profile_route(command.profile_id)
+    except Exception as exc:
+        app["registry"].record_cloud_result_error(f"route table lookup failed: {exc}")
+        return False
+    if route is None or route.server_id == app["config"].server_id:
+        return False
+    forwarder = app.get("internal_forwarder")
+    if forwarder is None:
+        await _post_cloud_result(
+            app,
+            command.id,
+            False,
+            profile_id=command.profile_id,
+            error=f"no peer Router configured for server {route.server_id}",
+            cloud_bridge_url=command.cloud_bridge_url,
+        )
+        return True
+    try:
+        await forwarder.forward_command(route.server_id, command)
+    except Exception as exc:
+        await _post_cloud_result(
+            app,
+            command.id,
+            False,
+            profile_id=command.profile_id,
+            error=str(exc),
+            cloud_bridge_url=command.cloud_bridge_url,
+        )
+    return True
+
+
+async def _enqueue_local_command(app: web.Application, command: TransitCommand) -> None:
+    registry: RouterRegistry = app["registry"]
+    try:
+        connection = registry.connection_for_profile(command.profile_id)
+    except DeliveryError as exc:
+        _record_audit(app, command, "failed", device_id=_bound_device_id(app, command.profile_id), detail=str(exc))
+        await _post_cloud_result(
+            app,
+            command.id,
+            False,
+            profile_id=command.profile_id,
+            error=str(exc),
+            cloud_bridge_url=command.cloud_bridge_url,
+        )
+        return
+    _record_audit(app, command, "queued", device_id=connection.device_id)
+    app["queues"][command.profile_id].append(command)
+    await _dispatch_next_for_profile(app, command.profile_id)
+
+
+def _is_rate_limited(app: web.Application, profile_id: str) -> bool:
+    config: RouterConfig = app["config"]
+    if config.rate_limit_per_profile <= 0 or config.rate_limit_burst <= 0:
+        return False
+    now = time.monotonic()
+    window = 1.0
+    entries = app["rate_limit_windows"][profile_id]
+    while entries and now - entries[0] >= window:
+        entries.popleft()
+    allowed = min(config.rate_limit_per_profile, config.rate_limit_burst)
+    if len(entries) >= allowed:
+        return True
+    entries.append(now)
+    return False
+
+
+async def _dispatch_next_for_profile(app: web.Application, profile_id: str) -> None:
+    current_by_profile: dict[str, str] = app["current_by_profile"]
+    if profile_id in current_by_profile:
+        return
+    queue = app["queues"][profile_id]
+    if not queue:
+        return
+    registry: RouterRegistry = app["registry"]
+    command = queue.popleft()
+    try:
+        connection = registry.connection_for_profile(command.profile_id)
+        registry.add_inflight(command)
+        current_by_profile[command.profile_id] = command.id
+        try:
+            _record_audit(app, command, "delivered", device_id=connection.device_id)
+            await connection.ws.send_json(
+                command_frame_to_json(
+                    CommandFrame(
+                        id=command.id,
+                        profile_id=command.profile_id,
+                        action=command.action,
+                        params=command.params,
+                        timeout_ms=command.timeout_ms,
+                    )
+                )
+            )
+        except Exception as exc:
+            registry.remove_inflight(command.id)
+            _clear_current(app, command)
+            _record_audit(app, command, "failed", device_id=connection.device_id, detail=str(exc))
+            await _post_cloud_result(
+                app,
+                command.id,
+                False,
+                profile_id=command.profile_id,
+                error=str(exc),
+                cloud_bridge_url=command.cloud_bridge_url,
+            )
+            await _dispatch_next_for_profile(app, profile_id)
+            return
+        app["timeout_tasks"][command.id] = asyncio.create_task(_timeout_command(app, command))
+    except DeliveryError as exc:
+        _record_audit(app, command, "failed", detail=str(exc))
+        await _post_cloud_result(
+            app,
+            command.id,
+            False,
+            profile_id=command.profile_id,
+            error=str(exc),
+            cloud_bridge_url=command.cloud_bridge_url,
+        )
+        await _dispatch_next_for_profile(app, profile_id)
+
+
+async def _timeout_command(app: web.Application, command: TransitCommand) -> None:
+    await asyncio.sleep(command.timeout_ms / 1000)
+    if app["registry"].get_inflight(command.id) is None:
+        return
+    await _fail_command(
+        app,
+        command,
+        f"browser bridge timed out for profile {command.profile_id}",
+    )
+
+
+async def _fail_command(app: web.Application, command: TransitCommand, error: str) -> None:
+    registry: RouterRegistry = app["registry"]
+    registry.remove_inflight(command.id)
+    _cancel_timeout(app, command.id)
+    _remove_from_queue(app, command)
+    _clear_current(app, command)
+    _record_audit(app, command, "failed", detail=error)
+    await _post_cloud_result(
+        app,
+        command.id,
+        False,
+        profile_id=command.profile_id,
+        error=error,
+        cloud_bridge_url=command.cloud_bridge_url,
+    )
+    await _dispatch_next_for_profile(app, command.profile_id)
+
+
+async def _post_cloud_result(
+    app: web.Application,
+    command_id: str,
+    ok: bool,
+    *,
+    profile_id: str | None = None,
+    result=None,
+    error: str | None = None,
+    cloud_bridge_url: str | None = None,
+) -> None:
+    registry: RouterRegistry = app["registry"]
+    if profile_id:
+        registry.record_command_result(profile_id, ok=ok)
+        command = registry.get_inflight(command_id)
+        if command is not None:
+            _record_audit(
+                app,
+                command,
+                "completed" if ok else "failed",
+                detail=error or "",
+            )
+    try:
+        cloud_bridge = _cloud_bridge_for_result(app, cloud_bridge_url)
+        await cloud_bridge.post_result(command_id, ok, result=result, error=error)
+        registry.clear_cloud_result_error()
+    except Exception as exc:
+        registry.record_cloud_result_error(str(exc))
+
+
+def _cloud_bridge_for_result(app: web.Application, cloud_bridge_url: str | None):
+    if not cloud_bridge_url:
+        return app["cloud_bridge"]
+    normalized_url = cloud_bridge_url.rstrip("/")
+    config: RouterConfig = app["config"]
+    if normalized_url == config.cloud_bridge_url.rstrip("/"):
+        return app["cloud_bridge"]
+    return CloudBridgeClient(normalized_url, token=config.router_token)
+
+
+def _cancel_timeout(app: web.Application, command_id: str) -> None:
+    task = app["timeout_tasks"].pop(command_id, None)
+    if task is not None and task is not asyncio.current_task():
+        task.cancel()
+
+
+def _clear_current(app: web.Application, command: TransitCommand) -> None:
+    if app["current_by_profile"].get(command.profile_id) == command.id:
+        app["current_by_profile"].pop(command.profile_id, None)
+
+
+def _remove_from_queue(app: web.Application, command: TransitCommand) -> None:
+    queue = app["queues"].get(command.profile_id)
+    if not queue:
+        return
+    app["queues"][command.profile_id] = deque(
+        item for item in queue if item.id != command.id
+    )
+
+
+def _record_audit(
+    app: web.Application,
+    command: TransitCommand,
+    status: str,
+    *,
+    device_id: str | None = None,
+    detail: str = "",
+) -> None:
+    audit_store: CommandAuditStore | None = app.get("audit_store")
+    if audit_store is None:
+        return
+    audit_store.record(
+        command_id=command.id,
+        profile_id=command.profile_id,
+        action=command.action,
+        status=status,
+        params=command.params,
+        device_id=device_id,
+        detail=detail,
+    )
+
+
+def _bound_device_id(app: web.Application, profile_id: str) -> str | None:
+    registry: RouterRegistry = app["registry"]
+    bindings = registry.status().get("bindings", {})
+    if isinstance(bindings, dict):
+        device_id = bindings.get(profile_id)
+        return str(device_id) if device_id else None
+    return None
+
+
+async def _poll_loop(app: web.Application) -> None:
+    router_id = uuid.uuid4().hex[:8]
+    cloud_bridge = app["cloud_bridge"]
+    while True:
+        try:
+            command = await cloud_bridge.poll_next(router_id)
+            if isinstance(command, MalformedCloudCommand):
+                await _post_cloud_result(app, command.id, False, error=command.error)
+            elif command is not None:
+                await dispatch_command(app, command)
+            else:
+                await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            app["registry"].record_cloud_result_error(str(exc))
+            await asyncio.sleep(0.2)
+
+
+async def _load_binding_snapshot(app: web.Application) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    binding_provider = app.get("binding_provider")
+    if binding_provider is None:
+        registry_status = app["registry"].status()
+        return dict(registry_status["bindings"]), dict(registry_status["actionPolicies"])
+    if hasattr(binding_provider, "load_binding_snapshot"):
+        bindings, policies = await binding_provider.load_binding_snapshot()
+        return dict(bindings), dict(policies)
+    return dict(await binding_provider.load_bindings()), {}
+
+
+async def _on_startup(app: web.Application) -> None:
+    binding_provider = app.get("binding_provider")
+    if binding_provider is not None:
+        try:
+            bindings, policies = await _load_binding_snapshot(app)
+            app["registry"].update_bindings(bindings, policies)
+            app["registry"].clear_cloud_result_error()
+        except Exception as exc:
+            app["registry"].record_cloud_result_error(str(exc))
+    if app["start_poller"]:
+        app["poll_task"] = asyncio.create_task(_poll_loop(app))
+
+
+async def _on_cleanup(app: web.Application) -> None:
+    task = app.get("poll_task")
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    for timeout_task in list(app["timeout_tasks"].values()):
+        timeout_task.cancel()
+    if app["timeout_tasks"]:
+        await asyncio.gather(*app["timeout_tasks"].values(), return_exceptions=True)
+        app["timeout_tasks"].clear()
+    route_table = app.get("route_table")
+    if route_table is not None and hasattr(route_table, "close"):
+        await route_table.close()
+    internal_forwarder = app.get("internal_forwarder")
+    if internal_forwarder is not None and hasattr(internal_forwarder, "close"):
+        await internal_forwarder.close()
+    audit_store = app.get("audit_store")
+    if audit_store is not None and hasattr(audit_store, "close"):
+        audit_store.close()
+
+
+def create_router_app(
+    config: RouterConfig,
+    cloud_bridge=None,
+    binding_provider=None,
+    device_token_verifier=None,
+    route_table=None,
+    internal_forwarder=None,
+    *,
+    start_poller: bool = True,
+) -> web.Application:
+    app = web.Application()
+    app["config"] = config
+    app["registry"] = RouterRegistry(config.bindings, config.binding_policies)
+    app["cloud_bridge"] = cloud_bridge or CloudBridgeClient(
+        config.cloud_bridge_url,
+        token=config.router_token,
+    )
+    app["binding_provider"] = binding_provider or (
+        WebUIBindingProvider(config.web_ui_url, token=config.router_token)
+        if config.web_ui_url
+        else None
+    )
+    app["device_token_verifier"] = device_token_verifier or (
+        WebUIDeviceTokenVerifier(config.web_ui_url)
+        if config.web_ui_url
+        else None
+    )
+    app["route_table"] = route_table or (
+        create_redis_profile_route_table(config.redis_url)
+        if config.redis_url
+        else None
+    )
+    app["internal_forwarder"] = internal_forwarder or (
+        InternalCommandForwarder(config.peer_urls, token=config.router_token)
+        if config.peer_urls
+        else None
+    )
+    app["audit_store"] = CommandAuditStore(config.audit_db_path) if config.audit_db_path else None
+    app["start_poller"] = start_poller
+    app["queues"] = defaultdict(deque)
+    app["current_by_profile"] = {}
+    app["timeout_tasks"] = {}
+    app["rate_limit_windows"] = defaultdict(deque)
+    app["transit_command_factory"] = _make_transit_factory(config)
+    app.router.add_get("/health", _health)
+    app.router.add_get("/status", _status)
+    app.router.add_get("/metrics", _metrics)
+    app.router.add_get("/audit/commands", _audit_commands)
+    app.router.add_get("/audit/summary", _audit_summary)
+    app.router.add_post("/bindings/refresh", _refresh_bindings)
+    app.router.add_post("/internal/commands", _internal_command)
+    app.router.add_get("/status/profile/{profile_id}", _profile_status)
+    app.router.add_get("/bridge", _bridge_ws)
+    app.on_startup.append(_on_startup)
+    app.on_cleanup.append(_on_cleanup)
+    return app
