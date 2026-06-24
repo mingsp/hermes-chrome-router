@@ -85,14 +85,15 @@ def test_parse_hello_frame_accepts_device_token_without_profile_ids():
     )
 
 
-def test_parse_hello_frame_rejects_non_list_profile_ids():
+@pytest.mark.parametrize("profile_ids", ["xuxiaofeng_profile", "", 0, False, None])
+def test_parse_hello_frame_rejects_non_list_profile_ids(profile_ids):
     with pytest.raises(ProtocolError, match="profileIds must be a list"):
         parse_hello_frame(
             {
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": "xuxiaofeng_profile",
+                "profileIds": profile_ids,
                 "clientVersion": "0.1.0",
             }
         )

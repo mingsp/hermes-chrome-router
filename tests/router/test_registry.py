@@ -40,6 +40,17 @@ def test_registry_records_heartbeat_extension_state():
     assert details["lastHeartbeatAt"] is not None
 
 
+def test_registry_ignores_client_reported_unbound_profiles():
+    registry = RouterRegistry(bindings={"xuxiaofeng_profile": "span-macbook"})
+    registry.register("span-macbook", ("unbound_profile",), FakeWS())
+
+    details = registry.status()["connectionDetails"]["span-macbook"]
+    assert details["profileIds"] == ["xuxiaofeng_profile"]
+    assert registry.connection_for_profile("xuxiaofeng_profile").device_id == "span-macbook"
+    with pytest.raises(DeliveryError, match="binding"):
+        registry.connection_for_profile("unbound_profile")
+
+
 def test_registry_rejects_offline_profile():
     registry = RouterRegistry(bindings={"xuxiaofeng_profile": "span-macbook"})
 
