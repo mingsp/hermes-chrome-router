@@ -289,7 +289,6 @@ async def test_management_overview_reports_router_connections_and_bindings(tmp_p
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.2.0",
             }
         )
@@ -485,7 +484,7 @@ async def test_metrics_exposes_router_state_for_prometheus(tmp_path):
         assert 'hermes_chrome_router_profile_command_errors_total{profile_id="xuxiaofeng_profile"} 1' in body
         assert 'hermes_chrome_router_profile_command_error_rate{profile_id="xuxiaofeng_profile"} 0.5' in body
         assert 'hermes_chrome_router_profile_online{profile_id="xuxiaofeng_profile",device_id="span-macbook"} 1' in body
-        assert 'hermes_chrome_router_profile_online{profile_id="default",device_id="span-macbook"} 0' in body
+        assert 'hermes_chrome_router_profile_online{profile_id="default",device_id="span-macbook"} 1' in body
     finally:
         await client.close()
 
@@ -586,7 +585,6 @@ async def test_websocket_hello_and_result_relay(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -595,6 +593,7 @@ async def test_websocket_hello_and_result_relay(tmp_path):
             "type": "hello_ack",
             "deviceId": "span-macbook",
             "minClientVersion": "0.1.0",
+            "bindings": [{"profileId": "xuxiaofeng_profile"}],
         }
 
         registry = app["registry"]
@@ -650,7 +649,6 @@ async def test_audit_commands_records_completed_websocket_results(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -715,7 +713,6 @@ async def test_websocket_heartbeat_updates_connection_status(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -723,6 +720,7 @@ async def test_websocket_heartbeat_updates_connection_status(tmp_path):
             "type": "hello_ack",
             "deviceId": "span-macbook",
             "minClientVersion": "0.1.0",
+            "bindings": [{"profileId": "xuxiaofeng_profile"}],
         }
 
         await ws.send_json(
@@ -767,7 +765,6 @@ async def test_profile_status_reports_binding_connection_and_extension(tmp_path)
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -859,7 +856,6 @@ async def test_profile_status_tool_gate_blocks_denied_action_policy(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -922,7 +918,6 @@ async def test_websocket_rejects_bad_token(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "wrong",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -954,7 +949,6 @@ async def test_websocket_rejects_old_client_version(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -994,7 +988,6 @@ async def test_websocket_accepts_verified_device_token(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "hclc_device_token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -1002,6 +995,7 @@ async def test_websocket_accepts_verified_device_token(tmp_path):
             "type": "hello_ack",
             "deviceId": "span-macbook",
             "minClientVersion": "0.1.0",
+            "bindings": [{"profileId": "xuxiaofeng_profile"}],
         }
         assert verifier.tokens == ["hclc_device_token"]
     finally:
@@ -1034,7 +1028,6 @@ async def test_websocket_rejects_verified_token_for_different_device(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "hclc_device_token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -1165,7 +1158,6 @@ async def test_result_profile_mismatch_posts_cloud_error(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -1232,7 +1224,6 @@ async def test_dispatch_serializes_same_profile_until_result(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -1275,7 +1266,6 @@ async def test_delivery_timeout_posts_cloud_error_and_advances_queue(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )
@@ -1358,7 +1348,6 @@ async def test_websocket_disconnect_fails_inflight_commands(tmp_path):
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": ["xuxiaofeng_profile"],
                 "clientVersion": "0.1.0",
             }
         )

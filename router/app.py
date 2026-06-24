@@ -347,6 +347,10 @@ async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
                 "type": "hello_ack",
                 "deviceId": hello.device_id,
                 "minClientVersion": config.min_client_version,
+                "bindings": [
+                    {"profileId": profile_id}
+                    for profile_id in registry.profile_ids_for_device(hello.device_id)
+                ],
             }
         )
 

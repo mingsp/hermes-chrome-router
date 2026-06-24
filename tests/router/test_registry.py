@@ -12,18 +12,19 @@ class FakeWS:
         self.sent.append(payload)
 
 
-def test_registry_registers_device_profiles():
+def test_registry_derives_device_profiles_from_bindings():
     registry = RouterRegistry(bindings={"xuxiaofeng_profile": "span-macbook"})
     ws = FakeWS()
 
-    registry.register("span-macbook", ("xuxiaofeng_profile",), ws)
+    registry.register("span-macbook", (), ws)
 
     assert registry.connection_for_profile("xuxiaofeng_profile").device_id == "span-macbook"
+    assert registry.profile_ids_for_device("span-macbook") == ["xuxiaofeng_profile"]
 
 
 def test_registry_records_heartbeat_extension_state():
     registry = RouterRegistry(bindings={"xuxiaofeng_profile": "span-macbook"})
-    registry.register("span-macbook", ("xuxiaofeng_profile",), FakeWS())
+    registry.register("span-macbook", (), FakeWS())
 
     registry.record_heartbeat(
         "span-macbook",

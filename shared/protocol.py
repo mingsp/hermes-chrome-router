@@ -82,14 +82,12 @@ def parse_cloud_next_payload(payload: dict[str, Any]) -> CloudCommand | None:
 def parse_hello_frame(payload: dict[str, Any]) -> HelloFrame:
     if payload.get("type") != "hello":
         raise ProtocolError("first WebSocket frame must be hello")
-    profile_values = payload.get("profileIds")
+    profile_values = payload.get("profileIds") or []
     if not isinstance(profile_values, list):
-        raise ProtocolError("profileIds must be a non-empty list")
+        raise ProtocolError("profileIds must be a list when provided")
     profile_ids = tuple(
         item.strip() for item in profile_values if isinstance(item, str) and item.strip()
     )
-    if not profile_ids:
-        raise ProtocolError("profileIds must be a non-empty list")
     return HelloFrame(
         device_id=_required_str(payload, "deviceId"),
         token=_required_str(payload, "token"),

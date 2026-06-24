@@ -72,6 +72,16 @@ class RouterRegistry:
             ws=ws,
         )
 
+    def _profile_ids_for_device(self, device_id: str) -> list[str]:
+        return sorted(
+            profile_id
+            for profile_id, bound_device_id in self._bindings.items()
+            if bound_device_id == device_id
+        )
+
+    def profile_ids_for_device(self, device_id: str) -> list[str]:
+        return self._profile_ids_for_device(device_id)
+
     def record_heartbeat(
         self,
         device_id: str,
@@ -101,8 +111,6 @@ class RouterRegistry:
             raise DeliveryError(binding_not_found(profile_id))
         connection = self._connections.get(device_id)
         if connection is None:
-            raise DeliveryError(bridge_not_connected(profile_id))
-        if profile_id not in connection.profile_ids:
             raise DeliveryError(bridge_not_connected(profile_id))
         return connection
 
@@ -155,13 +163,13 @@ class RouterRegistry:
             "connectionDetails": {
                 device_id: {
                     "deviceId": connection.device_id,
-                    "profileIds": list(connection.profile_ids),
+                    "profileIds": self._profile_ids_for_device(connection.device_id),
                     "lastHeartbeatAt": connection.last_heartbeat_at,
                     "extensionConnected": connection.extension_connected,
                     "extensionVersion": connection.extension_version,
                     "commandStats": {
                         profile_id: command_stats.get(profile_id, self.command_stats(profile_id))
-                        for profile_id in connection.profile_ids
+                        for profile_id in self._profile_ids_for_device(connection.device_id)
                     },
                 }
                 for device_id, connection in sorted(self._connections.items())
@@ -177,7 +185,7 @@ class RouterRegistry:
         device_id = self._bindings.get(profile_id)
         action_policy = dict(self._binding_policies.get(profile_id) or {})
         connection = self._connections.get(device_id or "")
-        online = connection is not None and profile_id in connection.profile_ids
+        online = connection is not None
         extension_connected = bool(connection.extension_connected) if online else False
         extension_version = connection.extension_version if online else None
         last_heartbeat_at = connection.last_heartbeat_at if online else None
@@ -218,7 +226,7 @@ class RouterRegistry:
                         "key": "client",
                         "status": "fail",
                         "title": "Hermes Local Client is not connected",
-                        "detail": f"device {device_id} is offline or did not announce profile {profile_id}",
+                        "detail": f"device {device_id} is offline",
                     }
                 )
 

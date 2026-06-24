@@ -67,14 +67,32 @@ def test_parse_hello_frame_normalizes_profile_ids():
     )
 
 
-def test_parse_hello_frame_rejects_empty_profile_ids():
-    with pytest.raises(ProtocolError, match="profileIds"):
+def test_parse_hello_frame_accepts_device_token_without_profile_ids():
+    frame = parse_hello_frame(
+        {
+            "type": "hello",
+            "deviceId": "span-macbook",
+            "token": "dev-token",
+            "clientVersion": "0.2.0",
+        }
+    )
+
+    assert frame == HelloFrame(
+        device_id="span-macbook",
+        token="dev-token",
+        profile_ids=(),
+        client_version="0.2.0",
+    )
+
+
+def test_parse_hello_frame_rejects_non_list_profile_ids():
+    with pytest.raises(ProtocolError, match="profileIds must be a list"):
         parse_hello_frame(
             {
                 "type": "hello",
                 "deviceId": "span-macbook",
                 "token": "dev-token",
-                "profileIds": [],
+                "profileIds": "xuxiaofeng_profile",
                 "clientVersion": "0.1.0",
             }
         )
