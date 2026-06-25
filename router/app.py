@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 import uuid
 from collections import defaultdict, deque
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from aiohttp import WSMsgType, web
 
@@ -28,6 +30,7 @@ from shared.timing import ROUTER_DELIVERY_TIMEOUT_MS
 
 
 logger = logging.getLogger(__name__)
+_URL_PATTERN = re.compile(r"https?://[^\s]+")
 
 
 def _make_transit_factory(config: RouterConfig):
@@ -48,6 +51,30 @@ def _make_transit_factory(config: RouterConfig):
         )
 
     return factory
+
+
+def _sanitize_url_for_log(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return value.split("?", 1)[0].split("#", 1)[0]
+    if not parsed.scheme or not parsed.hostname:
+        return value.split("?", 1)[0].split("#", 1)[0]
+    netloc = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None:
+        netloc = f"{netloc}:{port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _sanitize_error_for_log(exc: Exception) -> str:
+    return _URL_PATTERN.sub(
+        lambda match: _sanitize_url_for_log(match.group(0)),
+        str(exc),
+    )
 
 
 async def _health(_request: web.Request) -> web.Response:
@@ -306,7 +333,7 @@ async def _refresh_bindings(request: web.Request) -> web.Response:
         bindings, policies = await _load_binding_snapshot(request.app)
     except Exception as exc:
         request.app["registry"].record_cloud_result_error(str(exc))
-        logger.warning("binding_refresh_failed source=endpoint error=%s", exc)
+        logger.warning("binding_refresh_failed source=endpoint error=%s", _sanitize_error_for_log(exc))
         return web.json_response({"error": str(exc)}, status=502)
     request.app["registry"].update_bindings(bindings, policies)
     request.app["registry"].clear_cloud_result_error()
@@ -735,7 +762,7 @@ async def _on_startup(app: web.Application) -> None:
         "router_start host=%s port=%s cloud_bridge_url=%s web_ui_bindings=%s binding_count=%s audit_enabled=%s min_client_version=%s",
         config.host,
         config.port,
-        config.cloud_bridge_url,
+        _sanitize_url_for_log(config.cloud_bridge_url),
         bool(app.get("binding_provider")),
         len(config.bindings),
         bool(app.get("audit_store")),
@@ -754,7 +781,7 @@ async def _on_startup(app: web.Application) -> None:
             )
         except Exception as exc:
             app["registry"].record_cloud_result_error(str(exc))
-            logger.warning("binding_refresh_failed source=startup error=%s", exc)
+            logger.warning("binding_refresh_failed source=startup error=%s", _sanitize_error_for_log(exc))
     if app["start_poller"]:
         app["poll_task"] = asyncio.create_task(_poll_loop(app))
 

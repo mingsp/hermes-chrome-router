@@ -33,6 +33,16 @@ class FakeBindingProvider:
         return dict(self.bindings)
 
 
+class FailingBindingProvider:
+    def __init__(self, error):
+        self.error = error
+        self.calls = 0
+
+    async def load_bindings(self):
+        self.calls += 1
+        raise RuntimeError(self.error)
+
+
 class FakeDeviceTokenVerifier:
     def __init__(self, verified_device_id):
         self.verified_device_id = verified_device_id
@@ -528,8 +538,74 @@ async def test_startup_logs_binding_refresh_summary(tmp_path, caplog):
         await client.start_server()
     try:
         messages = [record.getMessage() for record in caplog.records]
-        assert any("binding_refresh_success" in message for message in messages)
-        assert any("binding_count=1" in message for message in messages)
+        assert any(
+            "binding_refresh_success source=startup binding_count=1" in message
+            for message in messages
+        )
+    finally:
+        await client.close()
+
+
+async def test_startup_router_start_sanitizes_cloud_bridge_url(tmp_path, caplog):
+    cloud = FakeCloudBridge()
+    provider = FakeBindingProvider({"xuxiaofeng_profile": "span-macbook"})
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="https://user:secret@example.com:9443/cloud?token=abc#frag",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, binding_provider=provider, start_poller=False)
+    client = TestClient(TestServer(app))
+    with caplog.at_level("INFO", logger="router.app"):
+        await client.start_server()
+    try:
+        messages = [record.getMessage() for record in caplog.records]
+        router_start_logs = [message for message in messages if message.startswith("router_start ")]
+        assert any(
+            "cloud_bridge_url=https://example.com:9443/cloud" in message
+            for message in router_start_logs
+        )
+        for message in router_start_logs:
+            assert "user" not in message
+            assert "secret" not in message
+            assert "token=abc" not in message
+            assert "frag" not in message
+    finally:
+        await client.close()
+
+
+async def test_startup_binding_refresh_failure_log_sanitizes_error(tmp_path, caplog):
+    cloud = FakeCloudBridge()
+    provider = FailingBindingProvider("failed https://user:secret@example.com/cloud?token=abc#frag")
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, binding_provider=provider, start_poller=False)
+    client = TestClient(TestServer(app))
+    with caplog.at_level("WARNING", logger="router.app"):
+        await client.start_server()
+    try:
+        messages = [record.getMessage() for record in caplog.records]
+        failures = [
+            message
+            for message in messages
+            if "binding_refresh_failed source=startup" in message
+        ]
+        assert failures
+        assert any("https://example.com/cloud" in message for message in failures)
+        for message in failures:
+            assert "user" not in message
+            assert "secret" not in message
+            assert "token=abc" not in message
+            assert "frag" not in message
     finally:
         await client.close()
 
@@ -560,6 +636,46 @@ async def test_refresh_bindings_endpoint_reloads_provider_snapshot(tmp_path):
         status = await client.get("/status", headers={"authorization": "Bearer dev-token"})
         assert (await status.json())["bindings"] == {}
         assert provider.calls == 2
+    finally:
+        await client.close()
+
+
+async def test_refresh_bindings_endpoint_failure_log_sanitizes_error(tmp_path, caplog):
+    cloud = FakeCloudBridge()
+    provider = FailingBindingProvider("failed https://user:secret@example.com/cloud?token=abc#frag")
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, binding_provider=provider, start_poller=False)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="router.app"):
+            response = await client.post(
+                "/bindings/refresh",
+                headers={"authorization": "Bearer dev-token"},
+            )
+
+        assert response.status == 502
+        messages = [record.getMessage() for record in caplog.records]
+        failures = [
+            message
+            for message in messages
+            if "binding_refresh_failed source=endpoint" in message
+        ]
+        assert failures
+        assert any("https://example.com/cloud" in message for message in failures)
+        for message in failures:
+            assert "user" not in message
+            assert "secret" not in message
+            assert "token=abc" not in message
+            assert "frag" not in message
     finally:
         await client.close()
 
