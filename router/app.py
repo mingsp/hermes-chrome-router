@@ -779,7 +779,7 @@ async def _post_cloud_result(
         )
     except Exception as exc:
         sanitized_error = _sanitize_error_message(exc)
-        registry.record_cloud_result_error(sanitized_error)
+        registry.record_cloud_result_error(str(exc))
         logger.warning(
             "cloud_result_post_failed command_id=%s profile_id=%s ok=%s error=%s",
             command_id,
