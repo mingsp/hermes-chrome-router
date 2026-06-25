@@ -853,19 +853,43 @@ def _bound_device_id(app: web.Application, profile_id: str) -> str | None:
 async def _poll_loop(app: web.Application) -> None:
     router_id = uuid.uuid4().hex[:8]
     cloud_bridge = app["cloud_bridge"]
+    empty_polls = 0
+    logger.info("poll_loop_start router_id=%s", router_id)
     while True:
         try:
             command = await cloud_bridge.poll_next(router_id)
             if isinstance(command, MalformedCloudCommand):
+                sanitized_error = _sanitize_error_message(Exception(command.error))
+                logger.info(
+                    "cloud_command_malformed command_id=%s error=%s",
+                    command.id,
+                    sanitized_error,
+                )
                 await _post_cloud_result(app, command.id, False, error=command.error)
             elif command is not None:
+                empty_polls = 0
                 await dispatch_command(app, command)
             else:
+                empty_polls += 1
+                if empty_polls % 1200 == 0:
+                    logger.debug(
+                        "poll_loop_idle router_id=%s empty_polls=%s",
+                        router_id,
+                        empty_polls,
+                    )
                 await asyncio.sleep(0.05)
         except asyncio.CancelledError:
+            logger.info("poll_loop_cancelled router_id=%s", router_id)
             raise
         except Exception as exc:
+            sanitized_error = _sanitize_error_message(exc)
             app["registry"].record_cloud_result_error(str(exc))
+            logger.warning(
+                "poll_loop_error router_id=%s error=%s",
+                router_id,
+                sanitized_error,
+                exc_info=logger.isEnabledFor(logging.DEBUG),
+            )
             await asyncio.sleep(0.2)
 
 
