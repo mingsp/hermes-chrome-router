@@ -888,7 +888,6 @@ async def _poll_loop(app: web.Application) -> None:
                 "poll_loop_error router_id=%s error=%s",
                 router_id,
                 sanitized_error,
-                exc_info=logger.isEnabledFor(logging.DEBUG),
             )
             await asyncio.sleep(0.2)
 

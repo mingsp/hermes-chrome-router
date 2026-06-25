@@ -1,7 +1,9 @@
 import asyncio
+import contextlib
+
 from aiohttp.test_utils import TestClient, TestServer
 
-from router.app import create_router_app, dispatch_command
+from router.app import _poll_loop, create_router_app, dispatch_command
 from router.config import RouterConfig
 from router.registry import TransitCommand
 from shared.protocol import CloudCommand
@@ -16,6 +18,15 @@ class FakeCloudBridge:
         if self.fail_results:
             raise RuntimeError("cloud result unavailable")
         self.results.append({"id": command_id, "ok": ok, "result": result, "error": error})
+
+
+class FailingPollCloudBridge(FakeCloudBridge):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    async def poll_next(self, _router_id):
+        raise RuntimeError(self.error)
 
 
 class FailingWS:
@@ -617,6 +628,41 @@ async def test_startup_binding_refresh_failure_log_sanitizes_error(tmp_path, cap
             assert "frag" not in message
     finally:
         await client.close()
+
+
+async def test_poll_loop_error_log_sanitizes_debug_exception_text(tmp_path, caplog):
+    cloud = FailingPollCloudBridge("failed https://user:secret@example.com/path?token=abc#frag")
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+
+    with caplog.at_level("DEBUG", logger="router.app"):
+        task = asyncio.create_task(_poll_loop(app))
+        try:
+            for _ in range(50):
+                if any("poll_loop_error" in record.getMessage() for record in caplog.records):
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("poll_loop_error log was not captured")
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    rendered_logs = caplog.text
+    assert "poll_loop_error" in rendered_logs
+    assert "https://example.com/path" in rendered_logs
+    assert "user" not in rendered_logs
+    assert "secret" not in rendered_logs
+    assert "token=abc" not in rendered_logs
+    assert "frag" not in rendered_logs
 
 
 async def test_startup_router_start_sanitizes_malformed_cloud_bridge_url(tmp_path, caplog):
