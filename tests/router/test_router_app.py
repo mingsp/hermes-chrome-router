@@ -511,6 +511,29 @@ async def test_startup_refreshes_bindings_from_provider(tmp_path):
         await client.close()
 
 
+async def test_startup_logs_binding_refresh_summary(tmp_path, caplog):
+    cloud = FakeCloudBridge()
+    provider = FakeBindingProvider({"xuxiaofeng_profile": "span-macbook"})
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, binding_provider=provider, start_poller=False)
+    client = TestClient(TestServer(app))
+    with caplog.at_level("INFO", logger="router.app"):
+        await client.start_server()
+    try:
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("binding_refresh_success" in message for message in messages)
+        assert any("binding_count=1" in message for message in messages)
+    finally:
+        await client.close()
+
+
 async def test_refresh_bindings_endpoint_reloads_provider_snapshot(tmp_path):
     cloud = FakeCloudBridge()
     provider = FakeBindingProvider({"xuxiaofeng_profile": "span-macbook"})

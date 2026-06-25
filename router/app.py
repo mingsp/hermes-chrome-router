@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 import uuid
 from collections import defaultdict, deque
@@ -24,6 +25,9 @@ from shared.protocol import (
     parse_result_frame,
 )
 from shared.timing import ROUTER_DELIVERY_TIMEOUT_MS
+
+
+logger = logging.getLogger(__name__)
 
 
 def _make_transit_factory(config: RouterConfig):
@@ -296,14 +300,21 @@ def _query_int(request: web.Request, key: str, default: int) -> int:
 async def _refresh_bindings(request: web.Request) -> web.Response:
     config: RouterConfig = request.app["config"]
     if not _is_authorized_router_request(request, config):
+        logger.info("binding_refresh_unauthorized source=endpoint")
         return web.json_response({"error": "unauthorized"}, status=401)
     try:
         bindings, policies = await _load_binding_snapshot(request.app)
     except Exception as exc:
         request.app["registry"].record_cloud_result_error(str(exc))
+        logger.warning("binding_refresh_failed source=endpoint error=%s", exc)
         return web.json_response({"error": str(exc)}, status=502)
     request.app["registry"].update_bindings(bindings, policies)
     request.app["registry"].clear_cloud_result_error()
+    logger.info(
+        "binding_refresh_success source=endpoint binding_count=%s policy_count=%s",
+        len(bindings),
+        len(policies),
+    )
     return web.json_response({"ok": True, "bindings": bindings, "actionPolicies": policies})
 
 
@@ -719,14 +730,31 @@ async def _load_binding_snapshot(app: web.Application) -> tuple[dict[str, str], 
 
 
 async def _on_startup(app: web.Application) -> None:
+    config: RouterConfig = app["config"]
+    logger.info(
+        "router_start host=%s port=%s cloud_bridge_url=%s web_ui_bindings=%s binding_count=%s audit_enabled=%s min_client_version=%s",
+        config.host,
+        config.port,
+        config.cloud_bridge_url,
+        bool(app.get("binding_provider")),
+        len(config.bindings),
+        bool(app.get("audit_store")),
+        config.min_client_version,
+    )
     binding_provider = app.get("binding_provider")
     if binding_provider is not None:
         try:
             bindings, policies = await _load_binding_snapshot(app)
             app["registry"].update_bindings(bindings, policies)
             app["registry"].clear_cloud_result_error()
+            logger.info(
+                "binding_refresh_success source=startup binding_count=%s policy_count=%s",
+                len(bindings),
+                len(policies),
+            )
         except Exception as exc:
             app["registry"].record_cloud_result_error(str(exc))
+            logger.warning("binding_refresh_failed source=startup error=%s", exc)
     if app["start_poller"]:
         app["poll_task"] = asyncio.create_task(_poll_loop(app))
 
