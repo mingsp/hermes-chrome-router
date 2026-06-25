@@ -820,6 +820,42 @@ async def test_websocket_hello_and_result_relay(tmp_path):
         await client.close()
 
 
+async def test_bridge_ws_logs_authorized_hello(tmp_path, caplog):
+    cloud = FakeCloudBridge()
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={"xuxiaofeng_profile": "span-macbook"},
+        min_client_version="0.2.0",
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        with caplog.at_level("INFO", logger="router.app"):
+            ws = await client.ws_connect("/bridge")
+            await ws.send_json(
+                {
+                    "type": "hello",
+                    "deviceId": "span-macbook",
+                    "token": "dev-token",
+                    "clientVersion": "0.2.0",
+                }
+            )
+            await ws.receive_json()
+            await ws.close()
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("bridge_hello_authorized" in message for message in messages)
+        assert any("device_id=span-macbook" in message for message in messages)
+        assert any("binding_count=1" in message for message in messages)
+        assert any("bridge_disconnected" in message for message in messages)
+    finally:
+        await client.close()
+
+
 async def test_audit_commands_records_completed_websocket_results(tmp_path):
     cloud = FakeCloudBridge()
     config = RouterConfig(

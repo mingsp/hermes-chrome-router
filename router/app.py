@@ -368,10 +368,17 @@ async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
         first = await ws.receive_json(timeout=5)
         hello = parse_hello_frame(first)
         if not await _authorize_hello(request.app, hello):
+            logger.info("bridge_hello_unauthorized device_id=%s", hello.device_id)
             await ws.send_json({"type": "error", "error": "unauthorized"})
             await ws.close(code=4001, message=b"unauthorized")
             return ws
         if _is_client_version_too_old(hello.client_version, config.min_client_version):
+            logger.info(
+                "bridge_hello_version_rejected device_id=%s client_version=%s min_client_version=%s",
+                hello.device_id,
+                hello.client_version,
+                config.min_client_version,
+            )
             await ws.send_json(
                 {
                     "type": "error",
@@ -383,6 +390,12 @@ async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
             return ws
         device_id = hello.device_id
         registry.register(hello.device_id, hello.profile_ids, ws)
+        logger.info(
+            "bridge_hello_authorized device_id=%s client_version=%s binding_count=%s",
+            hello.device_id,
+            hello.client_version,
+            len(registry.profile_ids_for_device(hello.device_id)),
+        )
         await ws.send_json(
             {
                 "type": "hello_ack",
@@ -410,6 +423,16 @@ async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
                             else None
                         ),
                     )
+                logger.debug(
+                    "bridge_heartbeat device_id=%s extension_connected=%s extension_version=%s",
+                    device_id,
+                    bool(payload.get("extensionConnected")),
+                    (
+                        payload.get("extensionVersion")
+                        if isinstance(payload.get("extensionVersion"), str)
+                        else None
+                    ),
+                )
                 await ws.send_json({"type": "heartbeat_ack", "timestamp": payload.get("timestamp")})
                 continue
             if payload.get("type") == "result":
@@ -451,12 +474,24 @@ async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
                 )
                 await _dispatch_next_for_profile(request.app, result.profile_id)
                 continue
+            logger.debug(
+                "bridge_unsupported_frame device_id=%s frame_type=%s",
+                device_id,
+                payload.get("type"),
+            )
             await ws.send_json({"type": "error", "error": f"unsupported frame type {payload.get('type')}"})
     except (ProtocolError, DeliveryError, TimeoutError) as exc:
+        logger.info("bridge_error device_id=%s error=%s", device_id, _sanitize_error_message(exc))
         await ws.send_json({"type": "error", "error": str(exc)})
     finally:
         if device_id:
-            for command in registry.unregister(device_id):
+            failed_commands = registry.unregister(device_id)
+            logger.info(
+                "bridge_disconnected device_id=%s failed_inflight_count=%s",
+                device_id,
+                len(failed_commands),
+            )
+            for command in failed_commands:
                 await _fail_command(
                     request.app,
                     command,
