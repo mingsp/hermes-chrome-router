@@ -57,8 +57,10 @@ def _sanitize_url_for_log(value: str) -> str:
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return value.split("?", 1)[0].split("#", 1)[0]
+        return "<invalid-url>"
     if not parsed.scheme or not parsed.hostname:
+        if parsed.scheme and parsed.netloc:
+            return urlunsplit((parsed.scheme, "<invalid-url>", parsed.path, "", ""))
         return value.split("?", 1)[0].split("#", 1)[0]
     netloc = parsed.hostname
     try:
@@ -70,7 +72,7 @@ def _sanitize_url_for_log(value: str) -> str:
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
 
-def _sanitize_error_for_log(exc: Exception) -> str:
+def _sanitize_error_message(exc: Exception) -> str:
     return _URL_PATTERN.sub(
         lambda match: _sanitize_url_for_log(match.group(0)),
         str(exc),
@@ -332,9 +334,10 @@ async def _refresh_bindings(request: web.Request) -> web.Response:
     try:
         bindings, policies = await _load_binding_snapshot(request.app)
     except Exception as exc:
-        request.app["registry"].record_cloud_result_error(str(exc))
-        logger.warning("binding_refresh_failed source=endpoint error=%s", _sanitize_error_for_log(exc))
-        return web.json_response({"error": str(exc)}, status=502)
+        sanitized_error = _sanitize_error_message(exc)
+        request.app["registry"].record_cloud_result_error(sanitized_error)
+        logger.warning("binding_refresh_failed source=endpoint error=%s", sanitized_error)
+        return web.json_response({"error": sanitized_error}, status=502)
     request.app["registry"].update_bindings(bindings, policies)
     request.app["registry"].clear_cloud_result_error()
     logger.info(
@@ -780,8 +783,9 @@ async def _on_startup(app: web.Application) -> None:
                 len(policies),
             )
         except Exception as exc:
-            app["registry"].record_cloud_result_error(str(exc))
-            logger.warning("binding_refresh_failed source=startup error=%s", _sanitize_error_for_log(exc))
+            sanitized_error = _sanitize_error_message(exc)
+            app["registry"].record_cloud_result_error(sanitized_error)
+            logger.warning("binding_refresh_failed source=startup error=%s", sanitized_error)
     if app["start_poller"]:
         app["poll_task"] = asyncio.create_task(_poll_loop(app))
 
