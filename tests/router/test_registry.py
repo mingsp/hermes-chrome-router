@@ -96,6 +96,57 @@ def test_unregister_returns_inflight_commands_for_device():
     assert failed == [command]
 
 
+def test_update_bindings_for_reconcile_returns_unbound_or_moved_inflight_commands():
+    registry = RouterRegistry(
+        bindings={
+            "xuxiaofeng_profile": "span-macbook",
+            "kevin_profile": "span-macbook",
+            "sales_profile": "sales-pc",
+        }
+    )
+    unchanged = TransitCommand(
+        id="cmd_unchanged",
+        profile_id="xuxiaofeng_profile",
+        cloud_bridge_url="http://cloud",
+        action="page.click",
+        params={},
+        timeout_ms=28000,
+    )
+    unbound = TransitCommand(
+        id="cmd_unbound",
+        profile_id="kevin_profile",
+        cloud_bridge_url="http://cloud",
+        action="page.click",
+        params={},
+        timeout_ms=28000,
+    )
+    moved = TransitCommand(
+        id="cmd_moved",
+        profile_id="sales_profile",
+        cloud_bridge_url="http://cloud",
+        action="page.click",
+        params={},
+        timeout_ms=28000,
+    )
+    registry.add_inflight(unchanged)
+    registry.add_inflight(unbound)
+    registry.add_inflight(moved)
+
+    failed = registry.update_bindings_for_reconcile(
+        {
+            "xuxiaofeng_profile": "span-macbook",
+            "sales_profile": "other-device",
+        }
+    )
+
+    assert failed == [unbound, moved]
+    assert registry.status()["bindings"] == {
+        "xuxiaofeng_profile": "span-macbook",
+        "sales_profile": "other-device",
+    }
+    assert registry.status()["inFlight"] == ["cmd_unchanged"]
+
+
 def test_registry_records_profile_command_stats_and_error_rate():
     registry = RouterRegistry(bindings={"xuxiaofeng_profile": "span-macbook"})
 

@@ -338,8 +338,11 @@ async def _refresh_bindings(request: web.Request) -> web.Response:
         request.app["registry"].record_cloud_result_error(sanitized_error)
         logger.warning("binding_refresh_failed source=endpoint error=%s", sanitized_error)
         return web.json_response({"error": sanitized_error}, status=502)
-    request.app["registry"].update_bindings(bindings, policies)
     request.app["registry"].clear_cloud_result_error()
+    failed_commands = request.app["registry"].update_bindings_for_reconcile(bindings, policies)
+    for command in failed_commands:
+        await _fail_command(request.app, command, "profile unbound from device")
+    await _reconcile_active_connections(request.app)
     logger.info(
         "binding_refresh_success source=endpoint binding_count=%s policy_count=%s",
         len(bindings),
@@ -354,6 +357,73 @@ def _is_authorized_router_request(request: web.Request, config: RouterConfig) ->
     header = request.headers.get("authorization", "")
     token = header.removeprefix("Bearer ").strip() if header.startswith("Bearer ") else ""
     return token == config.router_token
+
+
+async def _reconcile_active_connections(app: web.Application) -> None:
+    registry: RouterRegistry = app["registry"]
+    for connection in registry.active_connections():
+        try:
+            if await _is_connection_authorized_for_reconcile(app, connection):
+                await connection.ws.send_json(
+                    {
+                        "type": "binding_update",
+                        "bindings": [
+                            {"profileId": profile_id}
+                            for profile_id in registry.profile_ids_for_device(connection.device_id)
+                        ],
+                    }
+                )
+                continue
+
+            await connection.ws.send_json(
+                {
+                    "type": "error",
+                    "error": "unauthorized",
+                    "reason": "device_authorization_revoked",
+                }
+            )
+            failed_commands = registry.unregister(connection.device_id)
+            logger.info(
+                "bridge_authorization_revoked device_id=%s failed_inflight_count=%s",
+                connection.device_id,
+                len(failed_commands),
+            )
+            for command in failed_commands:
+                await _fail_command(app, command, "device authorization revoked")
+            await connection.ws.close(code=4001, message=b"device_authorization_revoked")
+        except Exception as exc:
+            await _fail_reconcile_connection(app, connection, exc)
+
+
+async def _fail_reconcile_connection(app: web.Application, connection, exc: Exception) -> None:
+    registry: RouterRegistry = app["registry"]
+    error = f"websocket reconcile failed: {_sanitize_error_message(exc)}"
+    failed_commands = registry.unregister(connection.device_id)
+    logger.info(
+        "bridge_reconcile_failed device_id=%s failed_inflight_count=%s error=%s",
+        connection.device_id,
+        len(failed_commands),
+        error,
+    )
+    for command in failed_commands:
+        await _fail_command(app, command, error)
+
+
+async def _is_connection_authorized_for_reconcile(app: web.Application, connection) -> bool:
+    config: RouterConfig = app["config"]
+    if config.router_token and connection.token == config.router_token:
+        return True
+    if not connection.token:
+        return False
+    verifier = app.get("device_token_verifier")
+    if verifier is None:
+        return False
+    try:
+        verified_device_id = await verifier.verify_device_token(connection.token)
+    except Exception as exc:
+        app["registry"].record_cloud_result_error(f"device token verification failed: {exc}")
+        return False
+    return verified_device_id == connection.device_id
 
 
 async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
@@ -389,7 +459,7 @@ async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
             await ws.close(code=4003, message=b"version_too_old")
             return ws
         device_id = hello.device_id
-        registry.register(hello.device_id, hello.profile_ids, ws)
+        registry.register(hello.device_id, hello.profile_ids, ws, token=hello.token)
         logger.info(
             "bridge_hello_authorized device_id=%s client_version=%s binding_count=%s",
             hello.device_id,

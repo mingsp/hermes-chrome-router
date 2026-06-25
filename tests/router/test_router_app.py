@@ -64,6 +64,10 @@ class FakeDeviceTokenVerifier:
         return self.verified_device_id
 
 
+class MutableDeviceTokenVerifier(FakeDeviceTokenVerifier):
+    pass
+
+
 async def test_health_and_status(tmp_path):
     cloud = FakeCloudBridge()
     config = RouterConfig(
@@ -719,6 +723,316 @@ async def test_refresh_bindings_endpoint_reloads_provider_snapshot(tmp_path):
         status = await client.get("/status", headers={"authorization": "Bearer dev-token"})
         assert (await status.json())["bindings"] == {}
         assert provider.calls == 2
+    finally:
+        await client.close()
+
+
+async def test_refresh_bindings_sends_binding_update_to_active_websocket(tmp_path):
+    cloud = FakeCloudBridge()
+    provider = FakeBindingProvider({"xuxiaofeng_profile": "span-macbook"})
+    verifier = FakeDeviceTokenVerifier("span-macbook")
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(
+        config,
+        cloud_bridge=cloud,
+        binding_provider=provider,
+        device_token_verifier=verifier,
+        start_poller=False,
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/bridge")
+        await ws.send_json(
+            {
+                "type": "hello",
+                "deviceId": "span-macbook",
+                "token": "hclc_device_token",
+                "clientVersion": "0.1.0",
+            }
+        )
+        await ws.receive_json()
+
+        provider.bindings = {
+            "xuxiaofeng_profile": "span-macbook",
+            "kevin_profile": "span-macbook",
+        }
+        response = await client.post(
+            "/bindings/refresh",
+            headers={"authorization": "Bearer dev-token"},
+        )
+
+        assert response.status == 200
+        assert await response.json() == {
+            "ok": True,
+            "bindings": {
+                "xuxiaofeng_profile": "span-macbook",
+                "kevin_profile": "span-macbook",
+            },
+            "actionPolicies": {},
+        }
+        assert await ws.receive_json() == {
+            "type": "binding_update",
+            "bindings": [
+                {"profileId": "kevin_profile"},
+                {"profileId": "xuxiaofeng_profile"},
+            ],
+        }
+        assert not ws.closed
+        assert verifier.tokens == ["hclc_device_token", "hclc_device_token"]
+    finally:
+        await client.close()
+
+
+async def test_refresh_bindings_isolates_failed_websocket_and_updates_healthy_connection(tmp_path):
+    cloud = FakeCloudBridge()
+    provider = FakeBindingProvider(
+        {
+            "broken_profile": "broken-device",
+            "healthy_profile": "healthy-device",
+        }
+    )
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, binding_provider=provider, start_poller=False)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        app["registry"].register("broken-device", (), FailingWS(), token="dev-token")
+        app["registry"].add_inflight(
+            TransitCommand("cmd_broken", "broken_profile", "http://cloud", "page.click", {}, 28000)
+        )
+
+        healthy_ws = await client.ws_connect("/bridge")
+        await healthy_ws.send_json(
+            {
+                "type": "hello",
+                "deviceId": "healthy-device",
+                "token": "dev-token",
+                "clientVersion": "0.1.0",
+            }
+        )
+        await healthy_ws.receive_json()
+
+        provider.bindings = {
+            "broken_profile": "broken-device",
+            "healthy_profile": "healthy-device",
+            "new_profile": "healthy-device",
+        }
+        response = await client.post(
+            "/bindings/refresh",
+            headers={"authorization": "Bearer dev-token"},
+        )
+
+        assert response.status == 200
+        assert (await response.json())["bindings"] == {
+            "broken_profile": "broken-device",
+            "healthy_profile": "healthy-device",
+            "new_profile": "healthy-device",
+        }
+        assert await healthy_ws.receive_json() == {
+            "type": "binding_update",
+            "bindings": [
+                {"profileId": "healthy_profile"},
+                {"profileId": "new_profile"},
+            ],
+        }
+
+        for _ in range(50):
+            if cloud.results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert app["registry"].status()["connections"] == ["healthy-device"]
+        assert cloud.results == [
+            {
+                "id": "cmd_broken",
+                "ok": False,
+                "result": None,
+                "error": "websocket reconcile failed: websocket send failed",
+            }
+        ]
+    finally:
+        await client.close()
+
+
+async def test_refresh_bindings_closes_active_websocket_when_token_is_revoked(tmp_path):
+    cloud = FakeCloudBridge()
+    provider = FakeBindingProvider({"xuxiaofeng_profile": "span-macbook"})
+    verifier = MutableDeviceTokenVerifier("span-macbook")
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(
+        config,
+        cloud_bridge=cloud,
+        binding_provider=provider,
+        device_token_verifier=verifier,
+        start_poller=False,
+    )
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/bridge")
+        await ws.send_json(
+            {
+                "type": "hello",
+                "deviceId": "span-macbook",
+                "token": "hclc_device_token",
+                "clientVersion": "0.1.0",
+            }
+        )
+        await ws.receive_json()
+        app["registry"].add_inflight(
+            TransitCommand("cmd_1", "xuxiaofeng_profile", "http://cloud", "page.click", {}, 28000)
+        )
+        verifier.verified_device_id = "other-device"
+
+        response = await client.post(
+            "/bindings/refresh",
+            headers={"authorization": "Bearer dev-token"},
+        )
+
+        assert response.status == 200
+        assert await ws.receive_json() == {
+            "type": "error",
+            "error": "unauthorized",
+            "reason": "device_authorization_revoked",
+        }
+        close = await ws.receive()
+        assert close.type.name == "CLOSE"
+
+        for _ in range(50):
+            if cloud.results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert app["registry"].status()["connections"] == []
+        assert cloud.results == [
+            {
+                "id": "cmd_1",
+                "ok": False,
+                "result": None,
+                "error": "device authorization revoked",
+            }
+        ]
+    finally:
+        await client.close()
+
+
+async def test_refresh_bindings_fails_inflight_command_for_profile_unbound_or_moved(tmp_path):
+    cloud = FakeCloudBridge()
+    provider = FakeBindingProvider({"xuxiaofeng_profile": "span-macbook"})
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, binding_provider=provider, start_poller=False)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/bridge")
+        await ws.send_json(
+            {
+                "type": "hello",
+                "deviceId": "span-macbook",
+                "token": "dev-token",
+                "clientVersion": "0.1.0",
+            }
+        )
+        await ws.receive_json()
+        app["registry"].add_inflight(
+            TransitCommand("cmd_1", "xuxiaofeng_profile", "http://cloud", "page.click", {}, 28000)
+        )
+        app["current_by_profile"]["xuxiaofeng_profile"] = "cmd_1"
+        provider.bindings = {"xuxiaofeng_profile": "other-device"}
+
+        response = await client.post(
+            "/bindings/refresh",
+            headers={"authorization": "Bearer dev-token"},
+        )
+
+        assert response.status == 200
+        for _ in range(50):
+            if cloud.results:
+                break
+            await asyncio.sleep(0.01)
+
+        assert cloud.results == [
+            {
+                "id": "cmd_1",
+                "ok": False,
+                "result": None,
+                "error": "profile unbound from device",
+            }
+        ]
+        assert app["registry"].status()["inFlight"] == []
+        assert app["current_by_profile"] == {}
+    finally:
+        await client.close()
+
+
+async def test_refresh_bindings_preserves_cloud_result_error_from_reconcile_failure(tmp_path):
+    cloud = FakeCloudBridge()
+    cloud.fail_results = True
+    provider = FakeBindingProvider({"xuxiaofeng_profile": "span-macbook"})
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, binding_provider=provider, start_poller=False)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        ws = await client.ws_connect("/bridge")
+        await ws.send_json(
+            {
+                "type": "hello",
+                "deviceId": "span-macbook",
+                "token": "dev-token",
+                "clientVersion": "0.1.0",
+            }
+        )
+        await ws.receive_json()
+        app["registry"].add_inflight(
+            TransitCommand("cmd_1", "xuxiaofeng_profile", "http://cloud", "page.click", {}, 28000)
+        )
+        provider.bindings = {"xuxiaofeng_profile": "other-device"}
+
+        response = await client.post(
+            "/bindings/refresh",
+            headers={"authorization": "Bearer dev-token"},
+        )
+
+        assert response.status == 200
+        status = await client.get("/status", headers={"authorization": "Bearer dev-token"})
+        assert (await status.json())["lastCloudResultError"] == "cloud result unavailable"
     finally:
         await client.close()
 

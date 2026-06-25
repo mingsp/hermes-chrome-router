@@ -27,6 +27,7 @@ class ConnectionEntry:
     device_id: str
     profile_ids: tuple[str, ...]
     ws: Any
+    token: str | None = None
     last_heartbeat_at: float | None = None
     extension_connected: bool = False
     extension_version: str | None = None
@@ -65,12 +66,36 @@ class RouterRegistry:
                 if isinstance(policy, dict)
             }
 
-    def register(self, device_id: str, profile_ids: tuple[str, ...], ws: Any) -> None:
+    def update_bindings_for_reconcile(
+        self,
+        bindings: dict[str, str],
+        binding_policies: dict[str, dict[str, Any]] | None = None,
+    ) -> list[TransitCommand]:
+        previous_bindings = self._bindings
+        self.update_bindings(bindings, binding_policies)
+        failed: list[TransitCommand] = []
+        for command_id, command in list(self._inflight.items()):
+            if previous_bindings.get(command.profile_id) != self._bindings.get(command.profile_id):
+                failed.append(command)
+                self._inflight.pop(command_id, None)
+        return failed
+
+    def register(
+        self,
+        device_id: str,
+        profile_ids: tuple[str, ...],
+        ws: Any,
+        token: str | None = None,
+    ) -> None:
         self._connections[device_id] = ConnectionEntry(
             device_id=device_id,
             profile_ids=profile_ids,
             ws=ws,
+            token=token,
         )
+
+    def active_connections(self) -> list[ConnectionEntry]:
+        return list(self._connections.values())
 
     def _profile_ids_for_device(self, device_id: str) -> list[str]:
         return sorted(
