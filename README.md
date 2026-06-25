@@ -42,6 +42,15 @@ Run the Router:
 python run_router.py
 ```
 
+Development logging defaults to `INFO`, so `python run_router.py` prints startup, binding, Local Client connection, cloud command, delivery, and result-posting events. For more frame-level detail, set:
+
+```bash
+export HERMES_CHROME_ROUTER_LOG_LEVEL=DEBUG
+python run_router.py
+```
+
+Logs intentionally omit router tokens, bridge tokens, raw command params, raw command results, page content, and screenshots.
+
 The equivalent module form is `python -m router`, but `python run_router.py` is the intended source-run command.
 
 For development tests, install test dependencies:
