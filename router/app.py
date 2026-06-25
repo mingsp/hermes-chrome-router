@@ -437,6 +437,12 @@ async def _bridge_ws(request: web.Request) -> web.WebSocketResponse:
                 continue
             if payload.get("type") == "result":
                 result = parse_result_frame(payload)
+                logger.info(
+                    "command_result_received command_id=%s profile_id=%s ok=%s",
+                    result.id,
+                    result.profile_id,
+                    result.ok,
+                )
                 command = registry.get_inflight(result.id)
                 if command is None:
                     await ws.send_json({"type": "error", "error": f"unknown command id {result.id}"})
@@ -535,7 +541,19 @@ def _version_tuple(version: str) -> tuple[int, int, int]:
 
 
 async def dispatch_command(app: web.Application, command) -> None:
+    logger.info(
+        "command_received command_id=%s profile_id=%s action=%s",
+        command.id,
+        command.profile_id,
+        command.action,
+    )
     if _is_rate_limited(app, command.profile_id):
+        logger.info(
+            "command_rate_limited command_id=%s profile_id=%s action=%s",
+            command.id,
+            command.profile_id,
+            command.action,
+        )
         await _post_cloud_result(
             app,
             command.id,
@@ -560,6 +578,14 @@ async def _enqueue_local_command(app: web.Application, command: TransitCommand) 
     try:
         connection = registry.connection_for_profile(command.profile_id)
     except DeliveryError as exc:
+        sanitized_error = _sanitize_error_message(exc)
+        logger.info(
+            "command_delivery_failed command_id=%s profile_id=%s action=%s error=%s",
+            command.id,
+            command.profile_id,
+            command.action,
+            sanitized_error,
+        )
         _record_audit(app, command, "failed", device_id=_bound_device_id(app, command.profile_id), detail=str(exc))
         await _post_cloud_result(
             app,
@@ -572,6 +598,14 @@ async def _enqueue_local_command(app: web.Application, command: TransitCommand) 
         return
     _record_audit(app, command, "queued", device_id=connection.device_id)
     app["queues"][command.profile_id].append(command)
+    logger.info(
+        "command_queued command_id=%s profile_id=%s action=%s device_id=%s queue_depth=%s",
+        command.id,
+        command.profile_id,
+        command.action,
+        connection.device_id,
+        len(app["queues"][command.profile_id]),
+    )
     await _dispatch_next_for_profile(app, command.profile_id)
 
 
@@ -606,6 +640,13 @@ async def _dispatch_next_for_profile(app: web.Application, profile_id: str) -> N
         current_by_profile[command.profile_id] = command.id
         try:
             _record_audit(app, command, "delivered", device_id=connection.device_id)
+            logger.info(
+                "command_delivered command_id=%s profile_id=%s action=%s device_id=%s",
+                command.id,
+                command.profile_id,
+                command.action,
+                connection.device_id,
+            )
             await connection.ws.send_json(
                 command_frame_to_json(
                     CommandFrame(
@@ -618,6 +659,15 @@ async def _dispatch_next_for_profile(app: web.Application, profile_id: str) -> N
                 )
             )
         except Exception as exc:
+            sanitized_error = _sanitize_error_message(exc)
+            logger.info(
+                "command_delivery_failed command_id=%s profile_id=%s action=%s device_id=%s error=%s",
+                command.id,
+                command.profile_id,
+                command.action,
+                connection.device_id,
+                sanitized_error,
+            )
             registry.remove_inflight(command.id)
             _clear_current(app, command)
             _record_audit(app, command, "failed", device_id=connection.device_id, detail=str(exc))
@@ -633,6 +683,14 @@ async def _dispatch_next_for_profile(app: web.Application, profile_id: str) -> N
             return
         app["timeout_tasks"][command.id] = asyncio.create_task(_timeout_command(app, command))
     except DeliveryError as exc:
+        sanitized_error = _sanitize_error_message(exc)
+        logger.info(
+            "command_delivery_failed command_id=%s profile_id=%s action=%s error=%s",
+            command.id,
+            command.profile_id,
+            command.action,
+            sanitized_error,
+        )
         _record_audit(app, command, "failed", detail=str(exc))
         await _post_cloud_result(
             app,
@@ -649,6 +707,13 @@ async def _timeout_command(app: web.Application, command: TransitCommand) -> Non
     await asyncio.sleep(command.timeout_ms / 1000)
     if app["registry"].get_inflight(command.id) is None:
         return
+    logger.info(
+        "command_timeout command_id=%s profile_id=%s action=%s timeout_ms=%s",
+        command.id,
+        command.profile_id,
+        command.action,
+        command.timeout_ms,
+    )
     await _fail_command(
         app,
         command,
@@ -663,6 +728,13 @@ async def _fail_command(app: web.Application, command: TransitCommand, error: st
     _remove_from_queue(app, command)
     _clear_current(app, command)
     _record_audit(app, command, "failed", detail=error)
+    logger.info(
+        "command_failed command_id=%s profile_id=%s action=%s error=%s",
+        command.id,
+        command.profile_id,
+        command.action,
+        _sanitize_error_message(Exception(error)),
+    )
     await _post_cloud_result(
         app,
         command.id,
@@ -699,8 +771,22 @@ async def _post_cloud_result(
         cloud_bridge = _cloud_bridge_for_result(app, cloud_bridge_url)
         await cloud_bridge.post_result(command_id, ok, result=result, error=error)
         registry.clear_cloud_result_error()
+        logger.info(
+            "cloud_result_posted command_id=%s profile_id=%s ok=%s",
+            command_id,
+            profile_id,
+            ok,
+        )
     except Exception as exc:
-        registry.record_cloud_result_error(str(exc))
+        sanitized_error = _sanitize_error_message(exc)
+        registry.record_cloud_result_error(sanitized_error)
+        logger.warning(
+            "cloud_result_post_failed command_id=%s profile_id=%s ok=%s error=%s",
+            command_id,
+            profile_id,
+            ok,
+            sanitized_error,
+        )
 
 
 def _cloud_bridge_for_result(app: web.Application, cloud_bridge_url: str | None):

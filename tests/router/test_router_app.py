@@ -1607,3 +1607,63 @@ async def test_websocket_disconnect_fails_inflight_commands(tmp_path):
         ]
     finally:
         await client.close()
+
+
+async def test_dispatch_logs_missing_binding_failure(tmp_path, caplog):
+    cloud = FakeCloudBridge()
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+
+    with caplog.at_level("INFO", logger="router.app"):
+        await dispatch_command(
+            app,
+            CloudCommand(
+                id="cmd_missing",
+                profile_id="missing_profile",
+                action="page.click",
+                params={"selector": "#submit", "secret": "do-not-log"},
+            ),
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("command_received" in message for message in messages)
+    assert any("command_delivery_failed" in message for message in messages)
+    assert any("command_id=cmd_missing" in message for message in messages)
+    assert "do-not-log" not in "\n".join(messages)
+
+
+async def test_dispatch_logs_cloud_result_post_failure(tmp_path, caplog):
+    cloud = FakeCloudBridge()
+    cloud.fail_results = True
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+
+    with caplog.at_level("WARNING", logger="router.app"):
+        await dispatch_command(
+            app,
+            CloudCommand(
+                id="cmd_cloud_down",
+                profile_id="missing_profile",
+                action="page.snapshot",
+                params={"secret": "do-not-log"},
+            ),
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("cloud_result_post_failed" in message for message in messages)
+    assert any("command_id=cmd_cloud_down" in message for message in messages)
+    assert "do-not-log" not in "\n".join(messages)
