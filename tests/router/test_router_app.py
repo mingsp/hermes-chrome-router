@@ -3,7 +3,12 @@ import contextlib
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from router.app import _poll_loop, create_router_app, dispatch_command
+from router.app import (
+    _RepeatedErrorLogLimiter,
+    _poll_loop,
+    create_router_app,
+    dispatch_command,
+)
 from router.config import RouterConfig
 from router.registry import TransitCommand
 from shared.protocol import CloudCommand
@@ -667,6 +672,50 @@ async def test_poll_loop_error_log_sanitizes_debug_exception_text(tmp_path, capl
     assert "secret" not in rendered_logs
     assert "token=abc" not in rendered_logs
     assert "frag" not in rendered_logs
+
+
+def test_repeated_error_log_limiter_suppresses_until_interval():
+    limiter = _RepeatedErrorLogLimiter(interval_seconds=10)
+
+    assert limiter.should_log("connection refused", now=100) == (True, 0)
+    assert limiter.should_log("connection refused", now=101) == (False, 1)
+    assert limiter.should_log("connection refused", now=102) == (False, 2)
+    assert limiter.should_log("connection refused", now=111) == (True, 2)
+    assert limiter.should_log("different error", now=112) == (True, 0)
+    assert limiter.should_log("different error", now=113) == (False, 1)
+    assert limiter.clear() == 1
+    assert limiter.should_log("different error", now=114) == (True, 0)
+
+
+async def test_poll_loop_error_log_suppresses_repeated_errors(tmp_path, caplog):
+    cloud = FailingPollCloudBridge("Cannot connect to host 127.0.0.1:16319")
+    config = RouterConfig(
+        host="127.0.0.1",
+        port=0,
+        cloud_bridge_url="http://cloud",
+        router_token="dev-token",
+        bindings_path=tmp_path / "bindings.json",
+        bindings={},
+    )
+    app = create_router_app(config, cloud_bridge=cloud, start_poller=False)
+    app["poll_loop_error_log_interval_seconds"] = 60
+
+    with caplog.at_level("WARNING", logger="router.app"):
+        task = asyncio.create_task(_poll_loop(app))
+        try:
+            await asyncio.sleep(0.55)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    poll_errors = [
+        record.getMessage()
+        for record in caplog.records
+        if "poll_loop_error" in record.getMessage()
+    ]
+    assert len(poll_errors) == 1
+    assert "suppressed_errors=0" in poll_errors[0]
 
 
 async def test_startup_router_start_sanitizes_malformed_cloud_bridge_url(tmp_path, caplog):

@@ -31,6 +31,39 @@ from shared.timing import ROUTER_DELIVERY_TIMEOUT_MS
 
 logger = logging.getLogger(__name__)
 _URL_PATTERN = re.compile(r"https?://[^\s]+")
+POLL_LOOP_ERROR_LOG_INTERVAL_SECONDS = 30.0
+
+
+class _RepeatedErrorLogLimiter:
+    def __init__(self, interval_seconds: float) -> None:
+        self.interval_seconds = interval_seconds
+        self.last_error: str | None = None
+        self.last_logged_at = 0.0
+        self.suppressed_count = 0
+
+    def should_log(self, error: str, now: float | None = None) -> tuple[bool, int]:
+        now = time.monotonic() if now is None else now
+        if error != self.last_error:
+            self.last_error = error
+            self.last_logged_at = now
+            self.suppressed_count = 0
+            return True, 0
+
+        if now - self.last_logged_at >= self.interval_seconds:
+            suppressed_count = self.suppressed_count
+            self.last_logged_at = now
+            self.suppressed_count = 0
+            return True, suppressed_count
+
+        self.suppressed_count += 1
+        return False, self.suppressed_count
+
+    def clear(self) -> int:
+        suppressed_count = self.suppressed_count
+        self.last_error = None
+        self.last_logged_at = 0.0
+        self.suppressed_count = 0
+        return suppressed_count
 
 
 def _make_transit_factory(config: RouterConfig):
@@ -924,10 +957,25 @@ async def _poll_loop(app: web.Application) -> None:
     router_id = uuid.uuid4().hex[:8]
     cloud_bridge = app["cloud_bridge"]
     empty_polls = 0
+    error_log_limiter = _RepeatedErrorLogLimiter(
+        float(
+            app.get(
+                "poll_loop_error_log_interval_seconds",
+                POLL_LOOP_ERROR_LOG_INTERVAL_SECONDS,
+            )
+        )
+    )
     logger.info("poll_loop_start router_id=%s", router_id)
     while True:
         try:
             command = await cloud_bridge.poll_next(router_id)
+            suppressed_errors = error_log_limiter.clear()
+            if suppressed_errors:
+                logger.info(
+                    "poll_loop_recovered router_id=%s suppressed_errors=%s",
+                    router_id,
+                    suppressed_errors,
+                )
             if isinstance(command, MalformedCloudCommand):
                 sanitized_error = _sanitize_error_message(Exception(command.error))
                 logger.info(
@@ -954,11 +1002,14 @@ async def _poll_loop(app: web.Application) -> None:
         except Exception as exc:
             sanitized_error = _sanitize_error_message(exc)
             app["registry"].record_cloud_result_error(str(exc))
-            logger.warning(
-                "poll_loop_error router_id=%s error=%s",
-                router_id,
-                sanitized_error,
-            )
+            should_log, suppressed_errors = error_log_limiter.should_log(sanitized_error)
+            if should_log:
+                logger.warning(
+                    "poll_loop_error router_id=%s error=%s suppressed_errors=%s",
+                    router_id,
+                    sanitized_error,
+                    suppressed_errors,
+                )
             await asyncio.sleep(0.2)
 
 
