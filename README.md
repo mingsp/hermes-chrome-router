@@ -5,7 +5,7 @@ This directory contains the source code for:
 - Command Router / Remote Extension Proxy
 - Router protocol harness for fake cloud bridge and fake extension traffic
 
-You can run it directly from source; installing it as a Python package is optional. The formal Hermes Local Client lives in `/Users/span/workspace/hermes-space/hermes-local-client` and uses Wails v3 with a Go backend and React renderer. `hermes-web-ui` has the server-side profile binding and device bridge token foundations used by the Router. Redis-backed profile route registration and peer Router forwarding are available for multi-server deployments. Router WebSocket hello acknowledgements include `serverId`; the Wails Local Client can reuse it as a `stickyServerId` reconnect hint for deployment-layer sticky routing.
+You can run it directly from source; installing it as a Python package is optional. The formal Hermes Local Client lives in `/Users/span/workspace/hermes-space/hermes-local-client` and uses Wails v3 with a Go backend and React renderer. `hermes-web-ui` has the server-side profile binding and device bridge token foundations used by the Router. The Router is intentionally single-instance for the internal small-team deployment path.
 
 ## Run From Source
 
@@ -53,6 +53,26 @@ Logs intentionally omit router tokens, bridge tokens, raw command params, raw co
 
 The equivalent module form is `python -m router`, but `python run_router.py` is the intended source-run command.
 
+## Run With Docker Compose
+
+The production container is built from the current checkout; it does not pull a prebuilt Router image. Keep secrets in `.env`, which is excluded from the Docker build context.
+
+On Linux, the Router uses host networking because its cloud bridge and Web UI may listen only on the host loopback interface. With host networking, `127.0.0.1:16319` and `127.0.0.1:8648` resolve to the host services rather than to an isolated container network.
+
+```bash
+cp .env.example .env
+chmod 600 .env
+mkdir -p ./data
+docker compose build
+docker compose up -d
+docker compose ps
+curl http://127.0.0.1:8787/health
+```
+
+`compose.yaml` runs the Router as a non-root UID/GID, uses a read-only root filesystem, and persists the audit database through `HERMES_CHROME_ROUTER_DATA_DIR` (default `./data`). Set that variable to an absolute server data directory when deploying outside a development checkout.
+
+Do not use this host-network Compose configuration on Docker Desktop for macOS as a production-equivalent network test. It is intended for the Linux Router host.
+
 For development tests, install test dependencies:
 
 ```bash
@@ -75,24 +95,19 @@ hermes-chrome-router
 - `HERMES_CHROME_ROUTER_TOKEN`: development/internal fallback token for Local Client hello frames and Router-to-cloud-bridge `Authorization: Bearer ...`
 - `HERMES_CHROME_WEB_UI_URL`: remote hermes-web-ui base URL used to load `/api/hermes/browser/profile-bindings` and verify `/api/devices/bridge-token/verify`
 - `HERMES_CHROME_BINDINGS_PATH`: optional development JSON file mapping `profileId` to `deviceId` when `HERMES_CHROME_WEB_UI_URL` is not used
-- `HERMES_CHROME_REDIS_URL`: optional Redis URL. When configured, Router records `profileId -> {serverId, deviceId}` routes with TTL for multi-server routing
-- `HERMES_CHROME_ROUTER_SERVER_ID`: stable server id written to Redis route entries, default `local`
-- `HERMES_CHROME_ROUTE_TTL_SECONDS`: Redis route alive TTL refreshed by Local Client heartbeats, default `60`
-- `HERMES_CHROME_ROUTER_PEERS`: optional JSON object mapping peer `serverId` to internal Router base URL, for example `{"router-b":"http://router-b.internal:8787"}`
 - `HERMES_CHROME_ROUTER_AUDIT_DB`: optional SQLite database path for the cloud-side command audit index. When set, Router records command lifecycle events with profile/action/status/detail and a SHA-256 params hash, not raw command params.
 - `HERMES_CHROME_ROUTER_PUBLIC_URL`: public WebSocket URL returned by `hermes-web-ui` device authorization callbacks, for example `wss://router.example.com/bridge`
 
 ## Router Endpoints
 
 - `GET /health`: liveness probe
-- `GET /status`: protected JSON router state for web-ui device status merging when `HERMES_CHROME_ROUTER_TOKEN` is configured, including `serverId`, per-profile command totals, and error rates
+- `GET /status`: protected JSON router state for web-ui device status merging when `HERMES_CHROME_ROUTER_TOKEN` is configured, including per-profile command totals and error rates
 - `GET /status/profile/{profileId}`: protected profile diagnostics when `HERMES_CHROME_ROUTER_TOKEN` is configured, including that profile's command totals and error rate
 - `GET /metrics`: protected Prometheus text metrics when `HERMES_CHROME_ROUTER_TOKEN` is configured, including connected Local Clients, bound profiles, in-flight commands, queued commands, cloud result channel health, per-profile online state, and per-profile command totals/errors/error rate
 - `GET /audit/commands`: protected searchable command audit index when `HERMES_CHROME_ROUTER_AUDIT_DB` is configured. Supports `profileId`, `commandId`, `deviceId`, `action`, `status`, `q`, `fromMs`, `toMs`, `limit`, and `offset` query parameters. Responses include `count`, `total`, `limit`, `offset`, and `items`.
 - `GET /audit/summary`: protected command audit operations summary when `HERMES_CHROME_ROUTER_AUDIT_DB` is configured. Supports the same filters as `/audit/commands` and returns total/failed/profile/device counts plus grouped profile/status/action totals for cloud management views.
 - `POST /bindings/refresh`: protected command for web-ui to refresh Router profile bindings after profile binding save/unbind operations
-- `POST /internal/commands`: protected Router-to-Router handoff endpoint used when Redis says a profile's WebSocket is connected to another Router server
-- `GET /bridge`: Hermes Local Client WebSocket entrypoint. `hello_ack` includes `serverId`; reconnecting clients may pass `stickyServerId` as a URL query parameter for load balancer routing.
+- `GET /bridge`: Hermes Local Client WebSocket entrypoint
 
 ## Headless Protocol Harness Environment
 
@@ -120,50 +135,6 @@ The headless Python protocol harness includes a localhost callback app for devel
 This is a development-safe credential store boundary for the harness. The Wails / Go Hermes Local Client stores the production device bridge token in macOS Keychain or Windows Credential Manager.
 
 Do not start, stop, or restart `hermes-web-ui` for this MVP.
-
-## Gateway HA Readiness
-
-Internal company deployments are expected to serve a small number of users. A single Router / single Gateway path is acceptable for the default acceptance flow. If a deployment explicitly enables multi-Router HA, run this before exercising a sticky/failover gateway:
-
-```bash
-python -m router.gateway_readiness
-```
-
-or install the package and run:
-
-```bash
-hermes-chrome-router-gateway-doctor
-```
-
-The command emits a JSON report with `ready`, `degraded`, or `blocked` status and checks:
-
-- Router token is not the development fallback.
-- Cloud bridge URL is configured.
-- Profile bindings come from `HERMES_CHROME_WEB_UI_URL` rather than only a development JSON file.
-- `HERMES_CHROME_ROUTER_PUBLIC_URL` is a public `wss://.../bridge` URL for Local Client callbacks.
-- Redis route table, stable non-local `serverId`, route TTL, and peer Router map are configured for sticky reconnect and failover handoff.
-- Cloud audit database is configured for production troubleshooting.
-
-This is a preflight check only. Real HA acceptance still requires running the actual load balancer / gateway sticky and failover drills with real Router instances. It is optional for the default internal small-team acceptance path.
-
-After the operator runs a real gateway failover drill, verify that the target Router owns the profile and can complete commands:
-
-```bash
-export HERMES_CHROME_ROUTER_STATUS_URL=https://router-b.internal
-export HERMES_CHROME_FAILOVER_PROFILE_ID=xuxiaofeng_profile
-export HERMES_CHROME_FAILOVER_EXPECTED_SERVER_ID=router-b
-export HERMES_CHROME_FAILOVER_EXPECTED_DEVICE_ID=span-macbook
-export HERMES_CHROME_FAILOVER_FROM_MS=1718500000000
-python -m router.gateway_acceptance
-```
-
-or install the package and run:
-
-```bash
-hermes-chrome-router-gateway-acceptance
-```
-
-The acceptance report reuses the gateway readiness checks, then queries protected Router `/status`, `/status/profile/{profileId}`, and `/audit/commands`. By default it requires one completed `tab.list` command after the drill; override with `HERMES_CHROME_FAILOVER_REQUIRED_ACTIONS=tab.list,page.snapshot`. This records machine-checkable evidence for the drill, but the load balancer / gateway failover itself still has to be executed in the real deployment.
 
 ## Internal Acceptance Bundle
 
@@ -195,15 +166,7 @@ or install the package and run:
 hermes-chrome-router-acceptance-bundle --output ./artifacts/chrome-router-acceptance.json
 ```
 
-The bundle runs `e2e_acceptance`, prints the combined JSON report, and optionally writes it to disk. Gateway failover is reported under `optionalReports.gatewayFailover` as skipped by default because internal small-team acceptance does not require LB/Gateway pressure drills.
-
-To make Gateway failover a hard gate for an HA deployment, pass:
-
-```bash
-python -m router.acceptance_bundle --require-gateway-failover --output ./artifacts/chrome-router-acceptance.json
-```
-
-In that mode the bundle also runs `gateway_acceptance`, and the top-level status is `blocked` if either required report is blocked, `degraded` if either is degraded, and `ready` only when both required reports are ready.
+The bundle runs `e2e_acceptance`, prints the combined JSON report, and optionally writes it to disk.
 
 For the full production execution order and required evidence files, see `/Users/span/workspace/hermes-space/docs/hermes-chrome-production-acceptance-runbook.md`.
 
@@ -218,8 +181,6 @@ or install the package and run:
 ```bash
 hermes-chrome-router-acceptance-archive --archive-dir ./artifacts/hermes-chrome-acceptance
 ```
-
-Gateway evidence is a warning in the default internal acceptance path. To require it for an HA deployment, add `--require-gateway-failover` or set `HERMES_CHROME_ACCEPTANCE_REQUIRE_GATEWAY_FAILOVER=true`.
 
 ## Remote Chrome E2E Readiness
 

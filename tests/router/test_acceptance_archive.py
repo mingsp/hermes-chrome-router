@@ -12,12 +12,6 @@ READY_JSON_FILES = (
     "chrome-router-acceptance.json",
 )
 
-GATEWAY_JSON_FILES = (
-    "gateway-readiness.json",
-    "gateway-failover-acceptance.json",
-)
-
-
 def test_acceptance_archive_reports_ready_when_required_evidence_is_present(tmp_path):
     for filename in READY_JSON_FILES:
         (tmp_path / filename).write_text(json.dumps({"status": "ready"}) + "\n", encoding="utf-8")
@@ -26,7 +20,7 @@ def test_acceptance_archive_reports_ready_when_required_evidence_is_present(tmp_
     report = acceptance_archive_report(tmp_path)
 
     assert report["status"] == "ready"
-    assert report["summary"] == {"pass": 5, "warn": 4, "fail": 0}
+    assert report["summary"] == {"pass": 5, "warn": 0, "fail": 0}
     assert {check["id"] for check in report["checks"] if check["status"] == "pass"} == {
         "json-local-client-installed-acceptance",
         "json-remote-chrome-e2e-readiness",
@@ -34,36 +28,7 @@ def test_acceptance_archive_reports_ready_when_required_evidence_is_present(tmp_
         "json-chrome-router-acceptance",
         "text-remote-chrome-e2e-from-ms",
     }
-    assert {check["id"] for check in report["checks"] if check["status"] == "warn"} == {
-        "json-gateway-readiness",
-        "json-gateway-failover-acceptance",
-        "text-gateway-failover-from-ms",
-        "text-gateway-failover-drill",
-    }
-
-
-def test_acceptance_archive_can_require_gateway_failover_evidence(tmp_path):
-    for filename in READY_JSON_FILES + GATEWAY_JSON_FILES:
-        (tmp_path / filename).write_text(json.dumps({"status": "ready"}) + "\n", encoding="utf-8")
-    (tmp_path / "remote-chrome-e2e-from-ms.txt").write_text("1718500000000\n", encoding="utf-8")
-    (tmp_path / "gateway-failover-from-ms.txt").write_text("1718500001000\n", encoding="utf-8")
-    (tmp_path / "gateway-failover-drill.md").write_text("router-a -> router-b in 12s\n", encoding="utf-8")
-
-    report = acceptance_archive_report(tmp_path, require_gateway_failover=True)
-
-    assert report["status"] == "ready"
-    assert report["summary"] == {"pass": 9, "warn": 0, "fail": 0}
-    assert {check["id"] for check in report["checks"] if check["status"] == "pass"} == {
-        "json-local-client-installed-acceptance",
-        "json-remote-chrome-e2e-readiness",
-        "json-remote-chrome-e2e-acceptance",
-        "json-gateway-readiness",
-        "json-gateway-failover-acceptance",
-        "json-chrome-router-acceptance",
-        "text-remote-chrome-e2e-from-ms",
-        "text-gateway-failover-from-ms",
-        "text-gateway-failover-drill",
-    }
+    assert {check["id"] for check in report["checks"] if check["status"] == "warn"} == set()
 
 
 def test_acceptance_archive_blocks_when_required_evidence_is_missing_or_not_ready(tmp_path):

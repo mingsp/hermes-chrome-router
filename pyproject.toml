@@ -9,7 +9,6 @@ description = "Hermes Chrome Command Router and protocol harness"
 requires-python = ">=3.11"
 dependencies = [
   "aiohttp>=3.9,<4",
-  "redis>=5,<6",
 ]
 
 [project.optional-dependencies]
@@ -23,8 +22,6 @@ dev = [
 hermes-chrome-router = "router.__main__:main"
 hermes-chrome-router-acceptance-archive = "router.acceptance_archive:main"
 hermes-chrome-router-acceptance-bundle = "router.acceptance_bundle:main"
-hermes-chrome-router-gateway-doctor = "router.gateway_readiness:main"
-hermes-chrome-router-gateway-acceptance = "router.gateway_acceptance:main"
 hermes-chrome-router-e2e-doctor = "router.e2e_readiness:main"
 hermes-chrome-router-e2e-acceptance = "router.e2e_acceptance:main"
 hermes-chrome-router-remote-acceptance = "router.remote_acceptance_run:main"

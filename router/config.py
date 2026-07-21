@@ -20,10 +20,6 @@ class RouterConfig:
     min_client_version: str = "0.1.0"
     rate_limit_per_profile: int = 10
     rate_limit_burst: int = 20
-    redis_url: str = ""
-    server_id: str = "local"
-    route_ttl_seconds: int = 60
-    peer_urls: dict[str, str] = field(default_factory=dict)
     audit_db_path: Path | None = None
 
 
@@ -49,21 +45,6 @@ def load_binding_policies(path: Path) -> dict[str, dict[str, Any]]:
     return values
 
 
-def load_peer_urls(raw: str) -> dict[str, str]:
-    if not raw.strip():
-        return {}
-    payload = json.loads(raw)
-    if not isinstance(payload, dict):
-        raise ValueError("HERMES_CHROME_ROUTER_PEERS must be a JSON object")
-    values: dict[str, str] = {}
-    for server_id, base_url in payload.items():
-        server_id = str(server_id or "").strip()
-        base_url = str(base_url or "").strip().rstrip("/")
-        if server_id and base_url:
-            values[server_id] = base_url
-    return values
-
-
 def load_config() -> RouterConfig:
     bindings_env = os.environ.get("HERMES_CHROME_BINDINGS_PATH", "").strip()
     bindings_path = Path(bindings_env).expanduser() if bindings_env else None
@@ -78,10 +59,6 @@ def load_config() -> RouterConfig:
         min_client_version=os.environ.get("HERMES_CHROME_MIN_CLIENT_VERSION", "0.1.0").strip() or "0.1.0",
         rate_limit_per_profile=int(os.environ.get("HERMES_CHROME_RATE_LIMIT_PER_USER", "10")),
         rate_limit_burst=int(os.environ.get("HERMES_CHROME_RATE_LIMIT_BURST", "20")),
-        redis_url=os.environ.get("HERMES_CHROME_REDIS_URL", "").strip(),
-        server_id=os.environ.get("HERMES_CHROME_ROUTER_SERVER_ID", "local").strip() or "local",
-        route_ttl_seconds=int(os.environ.get("HERMES_CHROME_ROUTE_TTL_SECONDS", "60")),
-        peer_urls=load_peer_urls(os.environ.get("HERMES_CHROME_ROUTER_PEERS", "")),
         audit_db_path=Path(os.environ["HERMES_CHROME_ROUTER_AUDIT_DB"]).expanduser()
         if os.environ.get("HERMES_CHROME_ROUTER_AUDIT_DB", "").strip()
         else None,

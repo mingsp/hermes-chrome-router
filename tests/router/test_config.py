@@ -55,10 +55,6 @@ def test_load_config_reads_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_CHROME_MIN_CLIENT_VERSION", "0.2.0")
     monkeypatch.setenv("HERMES_CHROME_RATE_LIMIT_PER_USER", "7")
     monkeypatch.setenv("HERMES_CHROME_RATE_LIMIT_BURST", "11")
-    monkeypatch.setenv("HERMES_CHROME_REDIS_URL", "redis://redis:6379/0")
-    monkeypatch.setenv("HERMES_CHROME_ROUTER_SERVER_ID", "router-a")
-    monkeypatch.setenv("HERMES_CHROME_ROUTE_TTL_SECONDS", "45")
-    monkeypatch.setenv("HERMES_CHROME_ROUTER_PEERS", '{"router-b":"http://router-b.internal:8787"}')
     monkeypatch.setenv("HERMES_CHROME_ROUTER_AUDIT_DB", str(tmp_path / "audit.sqlite3"))
 
     assert load_config() == RouterConfig(
@@ -73,10 +69,6 @@ def test_load_config_reads_env(monkeypatch, tmp_path):
         min_client_version="0.2.0",
         rate_limit_per_profile=7,
         rate_limit_burst=11,
-        redis_url="redis://redis:6379/0",
-        server_id="router-a",
-        route_ttl_seconds=45,
-        peer_urls={"router-b": "http://router-b.internal:8787"},
         audit_db_path=tmp_path / "audit.sqlite3",
     )
 

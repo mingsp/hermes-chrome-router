@@ -25,7 +25,6 @@ async def run_remote_acceptance_phase(
     env: Mapping[str, str] | None = None,
     fetch_json: FetchJSON | None = None,
     now_ms: NowMS | None = None,
-    require_gateway_failover: bool = False,
 ) -> dict[str, Any]:
     root = Path(archive_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -48,13 +47,9 @@ async def run_remote_acceptance_phase(
         values.setdefault("HERMES_CHROME_E2E_FROM_MS", _read_from_ms(root))
         acceptance = await e2e_acceptance_report(values, fetch_json=fetch_json)
         _write_json(root / "remote-chrome-e2e-acceptance.json", acceptance)
-        bundle = await acceptance_bundle_report(
-            values,
-            fetch_json=fetch_json,
-            require_gateway_failover=require_gateway_failover,
-        )
+        bundle = await acceptance_bundle_report(values, fetch_json=fetch_json)
         write_acceptance_bundle_report(bundle, root / "chrome-router-acceptance.json")
-        archive = acceptance_archive_report(root, require_gateway_failover=require_gateway_failover)
+        archive = acceptance_archive_report(root)
         return {
             "status": archive["status"],
             "phase": "collect",
@@ -92,7 +87,6 @@ async def _main_async(argv: Sequence[str] | None = None) -> int:
     report = await run_remote_acceptance_phase(
         _phase(args),
         archive_dir=_archive_dir(args),
-        require_gateway_failover=_require_gateway_failover(args),
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 1 if report["status"] == "blocked" else 0
@@ -115,10 +109,6 @@ def _archive_dir(args: list[str]) -> str:
         if value.startswith("--archive-dir=") or value.startswith("--output-dir="):
             return value.split("=", 1)[1]
     return "./artifacts/hermes-chrome-acceptance"
-
-
-def _require_gateway_failover(args: list[str]) -> bool:
-    return "--require-gateway-failover" in args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
